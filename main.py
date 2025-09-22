@@ -61,12 +61,14 @@ def build_country_map_uk_to_en() -> Dict[str, str]:
         "Гаїті": "Haiti",
         "Гана": "Ghana",
         "Гвінея": "Guinea",
-        "Демократична Республіка Конґо": "DRC",
-        "ДР Конго": "DRC",
+        # ---- FIX: зводимо все до "Congo (Kinshasa)" ----
+        "Демократична Республіка Конґо": "Congo (Kinshasa)",
+        "ДР Конго": "Congo (Kinshasa)",
         "Конго (Кіншаса)": "Congo (Kinshasa)",
+        # -----------------------------------------------
         "Республіка Конго": "Congo (Brazzaville)",
         "Конго-Браззавіль": "Congo (Brazzaville)",
-        "Конго": "Congo (Brazzaville)",  # often DRC in UA sheets
+        "Конго": "Congo (Kinshasa)",  # якщо пишуть просто "Конго" — приймаємо як DRC
         "Камерун": "Cameroon",
         "Кот-д'Івуар": "Cote d'Ivoire",
         "Кенія": "Kenya",
@@ -105,7 +107,11 @@ def build_country_canonical() -> Dict[str, str]:
         "Congo (Brazzaville)": "Congo (Brazzaville)",
         "Cameroon": "Cameroon",
         "Cote d'Ivoire": "Cote d'Ivoire",
-        "DRC": "DRC",
+        # ---- FIX: усі синоніми до Congo (Kinshasa) ----
+        "DRC": "Congo (Kinshasa)",
+        "DR Congo": "Congo (Kinshasa)",
+        "Democratic Republic of the Congo": "Congo (Kinshasa)",
+        # -----------------------------------------------
         "Ivory Coast": "Cote d'Ivoire",
         "Kenya": "Kenya",
         "Senegal": "Senegal",
@@ -126,19 +132,22 @@ def build_country_canonical() -> Dict[str, str]:
         "Dominican Republic": "Dominican Republic",
         "Canada": "Canada",
         "Philippines": "Philippines",
-        # UA inputs mapped to EN canonical
+
+        # UA → canonical EN
         "бенін": "Benin",
         "буркіна-фасо": "Burkina Faso",
         "габон": "Gabon",
         "гаїті": "Haiti",
         "гана": "Ghana",
         "гвінея": "Guinea",
-        "демократична республіка конґо": "DRC",
-        "др конго": "DRC",
+        # ---- FIX UA-синоніми ДРК ----
+        "демократична республіка конґо": "Congo (Kinshasa)",
+        "др конго": "Congo (Kinshasa)",
         "конго (кіншаса)": "Congo (Kinshasa)",
+        # --------------------------------
         "республіка конго": "Congo (Brazzaville)",
         "конго-браззавіль": "Congo (Brazzaville)",
-        "конго": "Congo (Brazzaville)",
+        "конго": "Congo (Kinshasa)",  # дефолт у бік DRC
         "камерун": "Cameroon",
         "кот-д'івуар": "Cote d'Ivoire",
         "кенія": "Kenya",
