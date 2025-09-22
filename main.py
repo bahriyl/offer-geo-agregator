@@ -147,7 +147,7 @@ def build_country_canonical() -> Dict[str, str]:
         # --------------------------------
         "республіка конго": "Congo (Brazzaville)",
         "конго-браззавіль": "Congo (Brazzaville)",
-        "конго": "Congo (Kinshasa)",  # дефолт у бік DRC
+        "конго": "Congo (Brazzaville)",  # дефолт у бік DRC
         "камерун": "Cameroon",
         "кот-д'івуар": "Cote d'Ivoire",
         "кенія": "Kenya",
