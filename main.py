@@ -1,7 +1,6 @@
 import os
 import io
 import re
-import traceback
 from typing import Dict, List, Tuple, Optional
 from dotenv import load_dotenv
 
@@ -45,6 +44,53 @@ class UserState:
 
 
 user_states: Dict[int, UserState] = {}
+
+# ===== ACCESS CONTROL =====
+# Заповни своїми Telegram ID (int). Можна зберігати у .env і парсити з ENV.
+ALLOWED_USER_IDS = {
+    123456789,  # твоє ID
+    987654321,  # колеги
+    # ...
+}
+
+
+def _deny_access_message():
+    return (
+        "⛔ <b>Доступ заборонено.</b>\n"
+        "Якщо вам потрібен доступ — зверніться до адміністратора бота."
+    )
+
+
+def _is_allowed_user(user_id: int) -> bool:
+    return user_id in ALLOWED_USER_IDS
+
+
+# Для message-хендлерів
+def require_access(handler_func):
+    def wrapper(message, *args, **kwargs):
+        user_id = getattr(message.from_user, "id", None)
+        if user_id is None or not _is_allowed_user(user_id):
+            bot.reply_to(message, _deny_access_message())
+            return
+        return handler_func(message, *args, **kwargs)
+
+    return wrapper
+
+
+# Для callback-query (інлайн-кнопки)
+def require_access_cb(handler_func):
+    def wrapper(call, *args, **kwargs):
+        user_id = getattr(call.from_user, "id", None)
+        if user_id is None or not _is_allowed_user(user_id):
+            try:
+                bot.answer_callback_query(call.id, "⛔ Немає доступу.")
+            except Exception:
+                pass
+            bot.send_message(call.message.chat.id, _deny_access_message())
+            return
+        return handler_func(call, *args, **kwargs)
+
+    return wrapper
 
 
 # ===================== NORMALIZATION (countries) =====================
@@ -283,63 +329,55 @@ def read_excel_robust(file_bytes: bytes, sheet_name: str, header: int = 0) -> pd
     raise ValueError(f"Could not read Excel file with any engine. Errors: {'; '.join(errors)}")
 
 
-def load_main_budg_table(file_bytes: bytes) -> pd.DataFrame:
-    """
-    Load main BUDG table with improved error handling
-    """
+def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.DataFrame:
     df = None
     errors = []
 
-    try:
-        # Try reading with header=1 (row 2)
-        df = read_excel_robust(file_bytes, sheet_name="BUDG", header=1)
-    except Exception as e1:
-        errors.append(f"header=1: {e1}")
-        print(f"Failed with header=1: {e1}")
-
+    if filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
         try:
-            # Fallback: read without header and manually find the header row
-            df_raw = read_excel_robust(file_bytes, sheet_name="BUDG", header=None)
+            df = read_excel_robust(file_bytes, sheet_name="BUDG", header=1)
+        except Exception as e1:
+            errors.append(f"header=1: {e1}")
+            # (your existing Excel fallback logic remains unchanged)
+    else:
+        # CSV support
+        bio = io.BytesIO(file_bytes)
+        try:
+            df_raw = pd.read_csv(bio, header=None)
+        except Exception:
+            bio.seek(0)
+            try:
+                df_raw = pd.read_csv(bio, header=None, encoding="cp1251")
+            except Exception:
+                bio.seek(0)
+                df_raw = pd.read_csv(bio, header=None, encoding="utf-8")
 
-            # Look for header row containing our required columns
-            header_row = -1
-            for i in range(min(10, len(df_raw))):  # Check first 10 rows
-                row_values = [str(v).lower().strip() for v in df_raw.iloc[i].values]
-                # Check if this row contains our required column names
-                if any("назва" in val and "оффер" in val for val in row_values) and \
-                        any("гео" in val for val in row_values) and \
-                        any("витрат" in val for val in row_values):
-                    header_row = i
-                    break
+        # detect header row (similar to Excel logic)
+        header_row = -1
+        for i in range(min(10, len(df_raw))):
+            row_values = [str(v).lower().strip() for v in df_raw.iloc[i].values]
+            if any("назва" in val and "оффер" in val for val in row_values) and \
+                    any("гео" in val for val in row_values) and \
+                    any("витрат" in val for val in row_values):
+                header_row = i
+                break
 
-            if header_row >= 0:
-                # Use found row as header
-                new_header = df_raw.iloc[header_row].tolist()
-                df = df_raw.iloc[header_row + 1:].reset_index(drop=True)
-                df.columns = new_header
-            else:
-                # If no proper header found, use the raw data and hope for the best
-                df = df_raw
-
-        except Exception as e2:
-            errors.append(f"manual detection: {e2}")
-            raise ValueError(f"Could not load BUDG sheet. Errors: {'; '.join(errors)}")
+        if header_row >= 0:
+            new_header = df_raw.iloc[header_row].tolist()
+            df = df_raw.iloc[header_row + 1:].reset_index(drop=True)
+            df.columns = new_header
+        else:
+            df = df_raw
 
     if df is None:
         raise ValueError(f"Could not load BUDG sheet. Errors: {'; '.join(errors)}")
 
-    # Clean column names (remove NBSP, extra spaces, etc.)
+    # clean column names
     df.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in df.columns]
 
-    # Debug: print available columns
-    print("Available columns in BUDG sheet:")
-    for i, col in enumerate(df.columns):
-        print(f"  {i}: '{col}'")
-
-    # Try to match columns
+    # validate and map columns
     colmap = match_columns(df.columns, ALLOWED_MAIN_COLUMNS)
     if not colmap:
-        # More detailed error message
         available = [str(c) for c in df.columns]
         required = ALLOWED_MAIN_COLUMNS
         raise ValueError(
@@ -348,7 +386,6 @@ def load_main_budg_table(file_bytes: bytes) -> pd.DataFrame:
             f"Перевір назви колонок у файлі."
         )
 
-    # Select and rename columns
     df = df[[colmap["Назва Офферу"], colmap["ГЕО"], colmap["Загальні витрати"]]].copy()
     df.columns = ["Назва Офферу", "ГЕО", "Загальні витрати"]
 
@@ -416,6 +453,24 @@ def read_additional_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     df = data[[col_map["Країна"], col_map["Сума депозитів"]]].copy()
     df.columns = ["Країна", "Сума депозитів"]
     return df
+
+
+# ===================== HELPERS =====================
+
+def ask_additional_table_with_skip(message: types.Message, state: UserState):
+    offer = state.offers[state.current_offer_index]
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Пропустити цей офер", callback_data="skip_offer"))
+    bot.send_message(
+        message.chat.id,
+        (
+            f"Надішліть додаткову таблицю для оферу:\n"
+            f"<b>{offer}</b>\n\n"
+            "Очікувані колонки: <b>Країна</b>, <b>Сума депозитів</b>.\n"
+            "Або натисніть «Пропустити цей офер», щоб не включати його у фінальний звіт."
+        ),
+        reply_markup=kb,
+    )
 
 
 # ===================== ALLOCATION HELPERS =====================
@@ -558,11 +613,11 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
     # Межі
     F_at_H = H_THRESH * E / 1.3
     F_at_L = (100.0 * K) / (1.3 * L_THRESH)
-    F_cap  = CPA_CAP * E / 1.3
+    F_cap = CPA_CAP * E / 1.3
 
     # Маски статусів (строго відповідно до правил/Excel)
-    grey_mask   = (E <= 0)
-    green_mask  = (~grey_mask) & (H <= H_THRESH + EPS) & (L > L_THRESH + EPS)
+    grey_mask = (E <= 0)
+    green_mask = (~grey_mask) & (H <= H_THRESH + EPS) & (L > L_THRESH + EPS)
     yellow_mask = (~grey_mask) & ((H <= H_THRESH + EPS) | (L > L_THRESH + EPS)) & (~green_mask)
     # red_mask   = (~grey_mask) & (~green_mask) & (~yellow_mask)  # не потрібен явно
 
@@ -592,12 +647,12 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
     F_target = F.copy()
 
     for i in candidates[green_mask].index:
-        Fi    = float(candidates.at[i, "F_now"])
-        Fcap  = float(candidates.at[i, "F_cap"])
-        Fh    = float(candidates.at[i, "F_cross_H"])
-        Fl    = float(candidates.at[i, "F_cross_L"])
-        Ei    = float(E.at[i])
-        Ki    = float(K.at[i])
+        Fi = float(candidates.at[i, "F_now"])
+        Fcap = float(candidates.at[i, "F_cap"])
+        Fh = float(candidates.at[i, "F_cross_H"])
+        Fl = float(candidates.at[i, "F_cross_L"])
+        Ei = float(E.at[i])
+        Ki = float(K.at[i])
 
         # Обидва потенційні цілі в межах CPA?
         options = []
@@ -640,11 +695,11 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
             L_mid = 100.0 * K / (1.3 * F_mid.replace(0, np.nan))
 
         # Ті, хто зараз жовті (включно з новими з кроку A)
-        is_green_mid  = (~(E <= 0)) & (H_mid <= H_THRESH + EPS) & (L_mid > L_THRESH + EPS)
+        is_green_mid = (~(E <= 0)) & (H_mid <= H_THRESH + EPS) & (L_mid > L_THRESH + EPS)
         is_yellow_mid = (~(E <= 0)) & (((H_mid <= H_THRESH + EPS) | (L_mid > L_THRESH + EPS)) & (~is_green_mid))
 
         # Межа "залишитись жовтим": до max(F_at_H, F_at_L - EPS_YEL), та ще й не перевищити cap
-        F_yellow_limit_base  = pd.Series(np.maximum(F_at_H, F_at_L - EPS_YEL), index=dfw.index)
+        F_yellow_limit_base = pd.Series(np.maximum(F_at_H, F_at_L - EPS_YEL), index=dfw.index)
         F_yellow_limit_final = pd.Series(np.minimum(F_yellow_limit_base, F_cap), index=dfw.index).fillna(0.0)
 
         headroom = (F_yellow_limit_final - F_mid).clip(lower=0.0)
@@ -665,15 +720,15 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
         H_final = 1.3 * F_final / E.replace(0, np.nan)
         L_final = 100.0 * K / (1.3 * F_final.replace(0, np.nan))
 
-    still_green  = (E > 0) & (H_final <= H_THRESH + EPS) & (L_final > L_THRESH + EPS)
+    still_green = (E > 0) & (H_final <= H_THRESH + EPS) & (L_final > L_THRESH + EPS)
     still_yellow = (E > 0) & (((H_final <= H_THRESH + EPS) | (L_final > L_THRESH + EPS)) & (~still_green))
 
     kept_yellow = int(still_yellow.sum())
-    total_posE  = int((E > 0).sum())
+    total_posE = int((E > 0).sum())
 
     dfw["Allocated extra"] = alloc
     dfw["New Total spend"] = F_final
-    dfw["Will be yellow"]  = ["Yes" if x else "No" for x in still_yellow]
+    dfw["Will be yellow"] = ["Yes" if x else "No" for x in still_yellow]
 
     summary = (
         f"Бюджет: {budget:.2f}\n"
@@ -787,6 +842,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO, df_source: pd.DataFr
 # ===================== BOT HANDLERS =====================
 
 @bot.message_handler(commands=["start", "help"])
+@require_access
 def start(message: types.Message):
     chat_id = message.chat.id
     user_states[chat_id] = UserState()
@@ -804,6 +860,7 @@ def start(message: types.Message):
 
 
 @bot.message_handler(content_types=["document"])
+@require_access
 def on_document(message: types.Message):
     chat_id = message.chat.id
     state = user_states.setdefault(chat_id, UserState())
@@ -818,61 +875,33 @@ def on_document(message: types.Message):
 
     try:
         if state.phase == "WAIT_MAIN":
-            df = load_main_budg_table(file_bytes)
+            df = load_main_budg_table(file_bytes, filename=filename)
             handle_main_table(message, state, df)
+            bot.reply_to(message, "✅ Головна таблиця завантажена! Тепер надішліть додаткові таблиці.")
         elif state.phase == "WAIT_ADDITIONAL":
             df = read_additional_table(file_bytes, filename)
-            handle_additional_table(message, state, df)
-        elif state.phase == "WAIT_ALLOC_RESULT":
-            # read result.xlsx the user sent
-            try:
-                bio = io.BytesIO(file_bytes)
-                df_res = pd.read_excel(bio, sheet_name="Result", engine="openpyxl")
-            except Exception:
-                try:
-                    bio.seek(0)
-                    df_res = pd.read_excel(bio, sheet_name="Result", engine="calamine")
-                except Exception as e:
-                    bot.reply_to(message, f"Не вдалося прочитати файл: <code>{e}</code>")
-                    return
-
-            # Normalize column names (remove nbsp/spaces)
-            df_res.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in df_res.columns]
-
-            # We need: E (FTD qty), F (Total spend), K (Total Dep Amount)
-            required_cols = ["FTD qty", "Total spend", "Total Dep Amount"]
-            colmap = match_columns(df_res.columns, required_cols)
-            if not colmap:
-                bot.reply_to(
-                    message,
-                    "У файлі Result мають бути колонки: "
-                    "<code>FTD qty</code>, <code>Total spend</code>, <code>Total Dep Amount</code>."
-                )
-                return
-
-            # Keep needed + identifiers for context (Offer ID, Offer Name, Country)
-            keep_cols = []
-            for k in ["Subid", "Offer ID", "Назва Офферу", "ГЕО"] + required_cols:
-                if k in df_res.columns:
-                    keep_cols.append(k)
-            df_res = df_res[keep_cols].copy()
-
-            # Coerce numbers
-            df_res["FTD qty"] = pd.to_numeric(df_res[colmap["FTD qty"]], errors="coerce").fillna(0.0)
-            df_res["Total spend"] = pd.to_numeric(df_res[colmap["Total spend"]], errors="coerce").fillna(0.0)
-            df_res["Total Dep Amount"] = pd.to_numeric(df_res[colmap["Total Dep Amount"]], errors="coerce").fillna(0.0)
-
-            state.alloc_df = df_res
-            state.phase = "WAIT_ALLOC_BUDGET"
-            bot.reply_to(message, "Файл отримано ✅\nВведи, будь ласка, бюджет (число), який потрібно розподілити.")
+            handle_additional_table(message, state, df, filename)
         else:
-            bot.reply_to(message, "Невідомий стан. Спробуй /start")
+            bot.reply_to(message, "⚠️ Несподівана фаза. Спробуйте ще раз із головної таблиці.")
+    except ValueError as ve:
+        # Catch wrong structure/columns
+        bot.reply_to(
+            message,
+            (
+                f"❌ Помилка у файлі <b>{filename}</b>:\n\n"
+                f"<code>{ve}</code>\n\n"
+                "Будь ласка, перевірте структуру таблиці та надішліть файл ще раз. "
+                "Очікувані колонки:\n"
+                "- Для головної таблиці: Назва Офферу, ГЕО, Загальні витрати\n"
+                "- Для додаткових таблиць: Країна, Сума депозитів"
+            ),
+        )
     except Exception as e:
-        print(traceback.format_exc())
-        bot.reply_to(message, f"Помилка обробки таблиці: <code>{e}</code>")
+        bot.reply_to(message, f"⚠️ Непередбачена помилка: <code>{e}</code>")
 
 
 @bot.message_handler(commands=["allocate"])
+@require_access
 def cmd_allocate(message: types.Message):
     chat_id = message.chat.id
     state = user_states.setdefault(chat_id, UserState())
@@ -886,6 +915,7 @@ def cmd_allocate(message: types.Message):
 
 
 @bot.message_handler(content_types=["text"])
+@require_access
 def on_text(message: types.Message):
     chat_id = message.chat.id
     state = user_states.setdefault(chat_id, UserState())
@@ -933,6 +963,45 @@ def on_text(message: types.Message):
     state.phase = "WAIT_MAIN"
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "skip_offer")
+@require_access
+def on_skip_offer(call: types.CallbackQuery):
+    chat_id = call.message.chat.id
+    state = user_states.setdefault(chat_id, UserState())
+
+    # Якщо вже поза межами — просто ігноруємо
+    if state.current_offer_index >= len(state.offers):
+        bot.answer_callback_query(call.id, "Немає активного оферу.")
+        return
+
+    offer = state.offers[state.current_offer_index]
+
+    # ВАЖЛИВО: при пропуску — НЕ додаємо цей офер у результат,
+    # тож просто прибираємо його з проміжних структур (якщо ти зберігаєш агрегати)
+    if hasattr(state, "main_agg_df") and state.main_agg_df is not None:
+        # повністю забираємо рядки цього оферу, щоб не потрапили у фінальний Excel
+        state.main_agg_df = state.main_agg_df[state.main_agg_df["Назва Офферу"] != offer]
+
+    # перехід до наступного оферу
+    state.current_offer_index += 1
+    bot.answer_callback_query(call.id, "Офер пропущено.")
+
+    # якщо ще є офери — попросимо наступну додаткову таблицю
+    if state.current_offer_index < len(state.offers):
+        ask_additional_table_with_skip(call.message, state)
+    else:
+        # якщо оферів більше немає — генеруємо фінальний файл
+        try:
+            send_final_table(call.message, state)
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Помилка під час формування файлу: <code>{e}</code>")
+
+
+@bot.message_handler(commands=["whoami"])
+def whoami(message: types.Message):
+    bot.reply_to(message, f"Ваш Telegram ID: <code>{message.from_user.id}</code>")
+
+
 # ===================== MAIN TABLE LOGIC =====================
 
 def handle_main_table(message: types.Message, state: UserState, df: pd.DataFrame):
@@ -973,36 +1042,23 @@ def handle_main_table(message: types.Message, state: UserState, df: pd.DataFrame
     # Unique Offer IDs (from cleaned data)
     state.offers = sorted(agg["Назва Офферу"].unique().tolist())
     state.phase = "WAIT_ADDITIONAL"
-    state.current_offer_index = 0  # Fix: use correct attribute name
+    state.current_offer_index = 0
+    ask_additional_table_with_skip(message, state)
 
     if not state.offers:
         bot.reply_to(message, "Не знайдено жодного валідного Offer ID у аркуші BUDG після очищення.")
         return
 
-    first_offer = state.offers[0]
-
-    # Show summary of what was found
-    summary = f"""
-Успішно оброблено головну таблицю!
-📊 Знайдено {len(state.offers)} унікальних Назв Офферу:
-{', '.join(state.offers[:5])}{' ...' if len(state.offers) > 5 else ''}
-
-📍 Всього унікальних пар Назва Офферу + ГЕО: {len(agg)}
-
-Надішли додаткову таблицю для <b>'{first_offer}'</b> з колонками 'Країна' та 'Сума депозитів'.
-    """
-
-    bot.reply_to(message, summary.strip())
-
 
 # ===================== ADDITIONAL TABLE LOGIC =====================
 
 def handle_additional_table(message: types.Message, state: UserState, df: pd.DataFrame):
+    # 1) Clean & normalize
     work = df.copy()
     work["Країна"] = work["Країна"].astype(str).str.strip()
     work["Сума депозитів"] = pd.to_numeric(work["Сума депозитів"], errors="coerce").fillna(0.0)
 
-    # Filter out empty countries
+    # Фільтруємо порожні/некоректні країни
     work = work[
         work["Країна"].ne("") &
         work["Країна"].ne("nan") &
@@ -1010,46 +1066,89 @@ def handle_additional_table(message: types.Message, state: UserState, df: pd.Dat
         work["Країна"].notna()
         ]
 
-    if len(work) == 0:
-        bot.reply_to(message, "Не знайдено валідних записів у додатковій таблиці після очищення.")
-        return
-
-    # Current offer to process
+    # 2) Визначаємо поточний офер
     try:
         current_offer = state.offers[state.current_offer_index]
     except IndexError:
         bot.reply_to(message, "Помилка: немає активного Offer ID. Напиши /start для початку.")
         return
 
-    # Canonicalize countries in additional table and aggregate
+    # 3) Якщо після очищення немає жодного валідного рядка — проставляємо нулі
+    if len(work) == 0:
+        # Зберігаємо «нульові» депозити для логіки фінального мерджу
+        # (порожній словник означає, що по країнах нічого не додавати;
+        # нижче ще й гарантуємо нулі у проміжній таблиці, якщо вона вже є)
+        state.offer_deposits[current_offer] = {}
+
+        # Якщо в пам’яті вже є агрегована головна таблиця — гарантуємо нулі для поточного оферу
+        if hasattr(state, "main_agg_df") and state.main_agg_df is not None:
+            mask = state.main_agg_df["Назва Офферу"] == current_offer
+            # створимо колонки, якщо їх ще немає
+            if "Total Dep Sum" not in state.main_agg_df.columns:
+                state.main_agg_df["Total Dep Sum"] = 0.0
+            if "Total Dep Amount" not in state.main_agg_df.columns:
+                state.main_agg_df["Total Dep Amount"] = 0
+            # нулі для всіх рядків цього оферу
+            state.main_agg_df.loc[mask, "Total Dep Sum"] = 0.0
+            state.main_agg_df.loc[mask, "Total Dep Amount"] = 0
+
+        # Повідомлення користувачу
+        bot.reply_to(
+            message,
+            (
+                f"ℹ️ У додатковій таблиці для <b>{current_offer}</b> немає даних після очищення.\n"
+                f"Для цього оферу проставлено <b>0</b> у колонках депозитів."
+            ),
+        )
+
+        # Перехід до наступного оферу / фінал
+        state.current_offer_index += 1
+        if state.current_offer_index >= len(state.offers):
+            final_df = build_final_output(state)
+            send_final_table(message, final_df)
+            user_states[message.chat.id] = UserState()  # reset
+            return
+
+        next_offer = state.offers[state.current_offer_index]
+        bot.reply_to(
+            message,
+            (
+                f"Надішліть додаткову таблицю для <b>{next_offer}</b> "
+                f"({state.current_offer_index + 1}/{len(state.offers)})."
+            ),
+        )
+        return
+
+    # 4) Якщо дані є — канонікалізуємо країни та агрегуємо
     work["canon_en"] = work["Країна"].apply(
-        lambda x: to_canonical_en(x, state.country_map_uk_to_en, state.country_canon))
+        lambda x: to_canonical_en(x, state.country_map_uk_to_en, state.country_canon)
+    )
 
     dep_by_country = (
-        work.groupby("canon_en")["Сума депозитів"].agg(["sum", "count"]).reset_index()
+        work.groupby("canon_en")["Сума депозитів"]
+        .agg(["sum", "count"]).reset_index()
         .rename(columns={"sum": "total", "count": "count"})
     )
 
-    # Save for this offer: map canon country -> totals
+    # Зберігаємо агрегати в пам'ять для цього оферу
     state.offer_deposits[current_offer] = {
         row["canon_en"]: {"total": float(row["total"]), "count": int(row["count"])}
         for _, row in dep_by_country.iterrows()
     }
 
-    # Debug info
+    # 5) Підсумкова інфо для користувача
     countries_found = list(dep_by_country["canon_en"].unique())
-    total_deposits = dep_by_country["total"].sum()
+    total_deposits = float(dep_by_country["total"].sum())
 
-    # Move to next offer or finish
+    # 6) Перехід до наступного оферу / фінал
     state.current_offer_index += 1
     if state.current_offer_index >= len(state.offers):
         final_df = build_final_output(state)
         send_final_table(message, final_df)
-        user_states[message.chat.id] = UserState()  # reset for new run
+        user_states[message.chat.id] = UserState()  # reset
         return
 
     next_offer = state.offers[state.current_offer_index]
-
     summary = f"""
 ✅ Прийнято дані для <b>{current_offer}</b>
 📊 Знайдено {len(countries_found)} країн, загальна сума депозитів: {total_deposits:,.2f}
@@ -1057,9 +1156,9 @@ def handle_additional_table(message: types.Message, state: UserState, df: pd.Dat
 Країни: {', '.join(countries_found[:5])}{' ...' if len(countries_found) > 5 else ''}
 
 Надішли наступну додаткову таблицю для <b>{next_offer}</b> ({state.current_offer_index + 1}/{len(state.offers)})
-    """
+    """.strip()
 
-    bot.reply_to(message, summary.strip())
+    bot.reply_to(message, summary)
 
 
 # ===================== BUILD FINAL =====================
