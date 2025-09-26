@@ -48,9 +48,7 @@ user_states: Dict[int, UserState] = {}
 # ===== ACCESS CONTROL =====
 # Заповни своїми Telegram ID (int). Можна зберігати у .env і парсити з ENV.
 ALLOWED_USER_IDS = {
-    123456789,  # твоє ID
-    987654321,  # колеги
-    # ...
+    155840708,
 }
 
 
@@ -434,11 +432,6 @@ def read_additional_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
 
     # Clean column names
     data.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in data.columns]
-
-    # Debug: print available columns
-    print(f"Available columns in {filename}:")
-    for i, col in enumerate(data.columns):
-        print(f"  {i}: '{col}'")
 
     col_map = match_columns(data.columns, ADDITIONAL_REQUIRED_COLS)
     if not col_map:
@@ -876,11 +869,11 @@ def on_document(message: types.Message):
     try:
         if state.phase == "WAIT_MAIN":
             df = load_main_budg_table(file_bytes, filename=filename)
-            handle_main_table(message, state, df)
             bot.reply_to(message, "✅ Головна таблиця завантажена! Тепер надішліть додаткові таблиці.")
+            handle_main_table(message, state, df)
         elif state.phase == "WAIT_ADDITIONAL":
             df = read_additional_table(file_bytes, filename)
-            handle_additional_table(message, state, df, filename)
+            handle_additional_table(message, state, df)
         else:
             bot.reply_to(message, "⚠️ Несподівана фаза. Спробуйте ще раз із головної таблиці.")
     except ValueError as ve:
@@ -914,7 +907,7 @@ def cmd_allocate(message: types.Message):
     )
 
 
-@bot.message_handler(content_types=["text"])
+@bot.message_handler(content_types=["text"], func=lambda m: not (m.text or "").startswith("/"))
 @require_access
 def on_text(message: types.Message):
     chat_id = message.chat.id
@@ -1148,6 +1141,9 @@ def handle_additional_table(message: types.Message, state: UserState, df: pd.Dat
         user_states[message.chat.id] = UserState()  # reset
         return
 
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Пропустити цей офер", callback_data="skip_offer"))
+
     next_offer = state.offers[state.current_offer_index]
     summary = f"""
 ✅ Прийнято дані для <b>{current_offer}</b>
@@ -1158,7 +1154,7 @@ def handle_additional_table(message: types.Message, state: UserState, df: pd.Dat
 Надішли наступну додаткову таблицю для <b>{next_offer}</b> ({state.current_offer_index + 1}/{len(state.offers)})
     """.strip()
 
-    bot.reply_to(message, summary)
+    bot.send_message(message.from_user.id, summary, reply_markup=kb)
 
 
 # ===================== BUILD FINAL =====================
