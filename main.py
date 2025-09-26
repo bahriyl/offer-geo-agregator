@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import html
 from typing import Dict, List, Tuple, Optional
 from dotenv import load_dotenv
 
@@ -725,6 +726,7 @@ def build_allocation_explanation(df_source: pd.DataFrame,
     # Сортуємо за найбільшою алокацією і обрізаємо
     rows.sort(key=lambda x: (-x[0], x[1]))
     detail_lines = [ln for _, ln in rows[:max_lines]]
+    escaped_detail_lines = [html.escape(ln) for ln in detail_lines]
 
     header = (
         f"Розподіл бюджету: {used:.2f} / {total_budget:.2f} використано; залишок {left:.2f}\n"
@@ -733,10 +735,12 @@ def build_allocation_explanation(df_source: pd.DataFrame,
         f" або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target); red — CPA>target×{RED_MULT:.1f}."
     )
 
+    header = html.escape(header)
+
     if not detail_lines:
         return header + "\n\n(Алокації по рядках відсутні — бюджет не було куди розподілити за правилами.)"
 
-    return header + "\n\nТоп розподілів:\n" + "\n".join(detail_lines) + \
+    return header + "\n\nТоп розподілів:\n" + "\n".join(escaped_detail_lines) + \
         ("\n\n…Список обрізано." if len(rows) > max_lines else "")
 
 
