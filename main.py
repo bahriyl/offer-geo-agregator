@@ -783,12 +783,12 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
 
     available_budget = float(F.sum())
 
-    order = T.sort_values(ascending=True).index.tolist()
+    spend_order = F.sort_values(ascending=True).index.tolist()
     alloc = pd.Series(0.0, index=dfw.index, dtype=float)
     rem = available_budget
 
     # Крок 1: переводимо green у yellow
-    for idx in order:
+    for idx in spend_order:
         if rem <= 1e-9:
             break
         allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
@@ -834,14 +834,16 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
 
         headroom = (yellow_limit - F_mid).clip(lower=0.0)
 
-        for idx in headroom.sort_values(ascending=False).index:
+        for idx in spend_order:
             if rem <= 1e-9:
                 break
-            allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
-            if allowance_left <= 1e-9:
+            if not is_yellow_mid.at[idx]:
                 continue
             head = float(headroom.at[idx])
             if head <= 1e-9:
+                continue
+            allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
+            if allowance_left <= 1e-9:
                 continue
             give = min(rem, head, allowance_left)
             if give <= 1e-9:
