@@ -486,12 +486,14 @@ def read_result_allocation_table(file_bytes: bytes, filename: str) -> pd.DataFra
     for optional_col in ["Subid", "Offer ID", "Назва Офферу", "ГЕО"]:
         _ensure_column(optional_col, required=False)
 
-    for required_col in ["FTD qty", "Total spend", "Total Dep Amount"]:
+    for required_col in ["FTD qty", "Total spend", "Total Dep Amount", "Total+%"]:
         _ensure_column(required_col, required=True)
 
     df["FTD qty"] = pd.to_numeric(df.get("FTD qty", 0), errors="coerce").fillna(0).astype(int)
     for col in ["Total spend", "Total Dep Amount"]:
         df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce").fillna(0.0).round(2)
+
+    df["Total+%"] = pd.to_numeric(df.get("Total+%", 0.0), errors="coerce").fillna(0.0)
 
     return df
 
@@ -623,67 +625,126 @@ def build_allocation_explanation(df_source: pd.DataFrame,
         ("\n\n…Список обрізано." if len(rows) > max_lines else "")
 
 
-def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, str, pd.Series]:
+def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float, pd.Series]:
     """
-    Розрахунок режиму «максимум жовтих»:
-      - шукаємо мінімальний додатковий spend, щоб перевести всі дозволені зелені рядки в жовті;
-      - не насичуємо жовті понад це (тобто відсутній крок B з compute_optimal_allocation).
+    Режим «максимум жовтих» з автоматичним бюджетом:
+      - кожен рядок має цільовий spend у колонці "Total+%" (верхня межа);
+      - доступний глобальний бюджет = сума позитивних (Target - Total spend);
+      - розподіл іде за зростанням Target: спершу переводимо green у yellow,
+        потім (якщо лишилися кошти) наближаємо yellow до межі red, не перетинаючи її.
+    Повертає оновлену таблицю, фактично розподілений бюджет та серію дельт по рядках.
     """
+
     dfw = df.copy()
+    dfw.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in dfw.columns]
 
-    E = pd.to_numeric(dfw["FTD qty"], errors="coerce").fillna(0.0)
-    F = pd.to_numeric(dfw["Total spend"], errors="coerce").fillna(0.0)
-    K = pd.to_numeric(dfw["Total Dep Amount"], errors="coerce").fillna(0.0)
+    E = pd.to_numeric(dfw.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
+    F = pd.to_numeric(dfw.get("Total spend", 0.0), errors="coerce").fillna(0.0)
+    K = pd.to_numeric(dfw.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
+    T = pd.to_numeric(dfw.get("Total+%", 0.0), errors="coerce").fillna(0.0)
 
-    with np.errstate(divide='ignore', invalid='ignore'):
-        H = 1.3 * F / E.replace(0, np.nan)
-        L = 100.0 * K / (1.3 * F.replace(0, np.nan))
+    # Глобальна верхня межа (з урахуванням CPA cap)
+    F_cap = pd.Series(np.where(E > 0, CPA_CAP * E / 1.3, 0.0), index=dfw.index)
+    cap_headroom = (F_cap - F).clip(lower=0.0)
+    target_delta = (T - F).clip(lower=0.0)
+    cap_for_min = cap_headroom.where(np.isfinite(cap_headroom), target_delta)
+    row_allowance = pd.Series(
+        np.minimum(target_delta.to_numpy(), cap_for_min.to_numpy()),
+        index=dfw.index,
+    )
+    row_allowance = pd.to_numeric(row_allowance, errors="coerce").fillna(0.0)
 
-    F_at_H = H_THRESH * E / 1.3
-    F_at_L = (100.0 * K) / (1.3 * L_THRESH)
-    F_cap = CPA_CAP * E / 1.3
+    available_budget = float(target_delta.sum())
 
-    grey_mask = (E <= 0)
-    green_mask = (~grey_mask) & (H <= H_THRESH + EPS) & (L > L_THRESH + EPS)
+    order = T.sort_values(ascending=True).index.tolist()
+    alloc = pd.Series(0.0, index=dfw.index, dtype=float)
+    F_now = F.copy()
+    rem = available_budget
 
-    F_cross_H = F_at_H + EPS_YEL
-    F_cross_L = F_at_L + EPS_YEL
+    F_at_H = pd.Series(np.where(E > 0, H_THRESH * E / 1.3, 0.0), index=dfw.index)
+    F_at_L = pd.Series(np.where(E > 0, (100.0 * K) / (1.3 * L_THRESH), 0.0), index=dfw.index)
 
-    candidates = pd.DataFrame({
-        "F_now": F,
-        "F_cap": F_cap,
-        "F_cross_H": F_cross_H,
-        "F_cross_L": F_cross_L,
-        "E": E,
-        "K": K,
-    })
+    def _min_yellow_target(e: float, f_cur: float, k: float) -> Optional[float]:
+        if e <= 0:
+            return None
+        H_cur = 1.3 * f_cur / e if e > 0 else float("inf")
+        L_cur = (100.0 * k) / (1.3 * f_cur) if f_cur > 0 else float("inf")
+        if (H_cur > H_THRESH + EPS) or (L_cur <= L_THRESH + EPS):
+            return None  # вже не green
 
-    F_target = F.copy()
-
-    for i in candidates[green_mask].index:
-        Fi = float(candidates.at[i, "F_now"])
-        Fcap = float(candidates.at[i, "F_cap"])
-        Fh = float(candidates.at[i, "F_cross_H"])
-        Fl = float(candidates.at[i, "F_cross_L"])
-        Ei = float(E.at[i])
-        Ki = float(K.at[i])
-
-        options = []
+        Fh = (H_THRESH * e / 1.3) + EPS_YEL
+        Fl = ((100.0 * k) / (1.3 * L_THRESH)) + EPS_YEL
+        candidates = []
         for Ft in (Fh, Fl):
-            if np.isfinite(Ft) and Ft > Fi + EPS and Ft <= Fcap + EPS:
-                Ht = 1.3 * Ft / Ei if Ei > 0 else float("inf")
-                Lt = (100.0 * Ki) / (1.3 * Ft) if Ft > 0 else float("inf")
-                is_red = (Ht > H_THRESH + EPS) and (Lt <= L_THRESH + EPS)
-                if not is_red:
-                    options.append(Ft)
+            if not np.isfinite(Ft) or Ft <= f_cur + EPS:
+                continue
+            Ht = 1.3 * Ft / e if e > 0 else float("inf")
+            Lt = (100.0 * k) / (1.3 * Ft) if Ft > 0 else float("inf")
+            is_red = (Ht > H_THRESH + EPS) and (Lt <= L_THRESH + EPS)
+            if not is_red:
+                candidates.append(Ft)
+        if not candidates:
+            return None
+        return min(candidates)
 
-        if options:
-            F_target.at[i] = min(options)
-        else:
-            F_target.at[i] = Fi
+    # Крок 1: переводимо green у yellow
+    for idx in order:
+        if rem <= 1e-9:
+            break
+        allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
+        if allowance_left <= 1e-9:
+            continue
+        ei = float(E.at[idx])
+        if ei <= 0:
+            continue
+        ki = float(K.at[idx])
+        f_cur = float(F_now.at[idx])
+        target_yellow = _min_yellow_target(ei, f_cur, ki)
+        if target_yellow is None:
+            continue
+        max_target = float(F.at[idx] + row_allowance.at[idx])
+        f_goal = min(target_yellow, max_target)
+        need = f_goal - f_cur
+        if need <= 1e-9:
+            continue
+        give = min(rem, need, allowance_left)
+        if give <= 1e-9:
+            continue
+        alloc.at[idx] += give
+        F_now.at[idx] += give
+        rem -= give
 
-    need_delta = (F_target - F).clip(lower=0.0)
-    alloc = need_delta.where(green_mask, 0.0)
+    # Крок 2: насичуємо yellow до межі red (залишаючись у yellow)
+    if rem > 1e-9:
+        F_yellow_limit = pd.Series(np.maximum(F_at_H, F_at_L - EPS_YEL), index=dfw.index)
+        for idx in order:
+            if rem <= 1e-9:
+                break
+            allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
+            if allowance_left <= 1e-9:
+                continue
+            ei = float(E.at[idx])
+            if ei <= 0:
+                continue
+            ki = float(K.at[idx])
+            f_cur = float(F_now.at[idx])
+            status_now = _classify_status(ei, f_cur, ki)
+            if status_now != "Yellow":
+                continue
+            max_target = min(
+                float(F.at[idx] + row_allowance.at[idx]),
+                float(F_cap.at[idx]) if np.isfinite(F_cap.at[idx]) else float("inf"),
+                float(F_yellow_limit.at[idx])
+            )
+            headroom = max_target - f_cur
+            if headroom <= 1e-9:
+                continue
+            give = min(rem, headroom, allowance_left)
+            if give <= 1e-9:
+                continue
+            alloc.at[idx] += give
+            F_now.at[idx] += give
+            rem -= give
 
     F_final = F + alloc
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -697,25 +758,9 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, str, 
     dfw["New Total spend"] = F_final
     dfw["Will be yellow"] = ["Yes" if x else "No" for x in still_yellow]
 
-    total_posE = int((E > 0).sum())
-    kept_yellow = int(still_yellow.sum())
-
-    before_status = [_classify_status(float(E[i]), float(F[i]), float(K[i])) for i in dfw.index]
-    after_status = [_classify_status(float(E[i]), float(F_final[i]), float(K[i])) for i in dfw.index]
-    green_to_yellow = sum(
-        1 for i in range(len(before_status)) if before_status[i] == "Green" and after_status[i] == "Yellow"
-    )
-
     used = float(alloc.sum())
 
-    summary = (
-        "Режим: максимум жовтих\n"
-        f"Додатковий spend для переведення зелених: {used:.2f}\n"
-        f"Жовтих після розподілу: {kept_yellow}/{total_posE} (зел.→жовт.: {green_to_yellow})\n"
-        f"Правила: додаємо мінімальний spend (CPA≤{CPA_CAP:g}), щоб перевести всі дозволені зелені в жовті."
-    )
-
-    return dfw, summary, alloc
+    return dfw, used, alloc
 
 
 def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.DataFrame, str, pd.Series]:
@@ -1053,7 +1098,34 @@ def on_document(message: types.Message):
                 state.phase = "WAIT_ALLOC_BUDGET"
                 bot.reply_to(message, "✅ Файл result.xlsx отримано. Введіть бюджет (наприклад: 200 або 200.5).")
             elif state.alloc_mode == "max_yellow":
-                _alloc_df, summary, alloc_vec = compute_allocation_max_yellow(state.alloc_df)
+                _alloc_df, used_budget, alloc_vec = compute_allocation_max_yellow(state.alloc_df)
+
+                total_spend = pd.to_numeric(state.alloc_df.get("Total spend", 0.0), errors="coerce").fillna(0.0)
+                total_target = pd.to_numeric(state.alloc_df.get("Total+%", 0.0), errors="coerce").fillna(0.0)
+                available_budget = float((total_target - total_spend).clip(lower=0.0).sum())
+                unused_budget = max(0.0, available_budget - used_budget)
+
+                df_norm = state.alloc_df.copy()
+                df_norm.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in df_norm.columns]
+                E = pd.to_numeric(df_norm.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
+                K = pd.to_numeric(df_norm.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
+                F_before = total_spend
+                F_after = (F_before + pd.to_numeric(alloc_vec, errors="coerce").reindex(df_norm.index).fillna(0.0))
+
+                before_status = [_classify_status(float(E[i]), float(F_before[i]), float(K[i])) for i in df_norm.index]
+                after_status = [_classify_status(float(E[i]), float(F_after[i]), float(K[i])) for i in df_norm.index]
+
+                total_posE = int((E > 0).sum())
+                yellow_after = sum(1 for s in after_status if s == "Yellow")
+                green_to_yellow = sum(
+                    1 for i in range(len(before_status)) if before_status[i] == "Green" and after_status[i] == "Yellow"
+                )
+
+                summary = (
+                    "Режим: максимум жовтих (Total+% цілі).\n"
+                    f"Цільовий бюджет: {available_budget:.2f}; використано: {used_budget:.2f}; невикористано: {unused_budget:.2f}\n"
+                    f"Жовтих після розподілу: {yellow_after}/{total_posE} (зел.→жовт.: {green_to_yellow})"
+                )
 
                 bio = io.BytesIO()
                 write_result_like_excel_with_new_spend(bio, state.alloc_df, new_total_spend=alloc_vec)
@@ -1066,7 +1138,6 @@ def on_document(message: types.Message):
                     caption=summary,
                 )
 
-                used_budget = float(pd.to_numeric(alloc_vec, errors="coerce").fillna(0.0).sum())
                 explanation = build_allocation_explanation(state.alloc_df, alloc_vec, used_budget, max_lines=20)
                 bot.send_message(chat_id, explanation)
 
@@ -1125,7 +1196,7 @@ def cmd_allocate(message: types.Message):
     keyboard = types.InlineKeyboardMarkup()
     keyboard.row(
         types.InlineKeyboardButton("📊 За бюджетом", callback_data="alloc_mode_budget"),
-        types.InlineKeyboardButton("💛 Максимум жовтих", callback_data="alloc_mode_max_yellow"),
+        types.InlineKeyboardButton("💛 Максимум жовтих (Total+%)", callback_data="alloc_mode_max_yellow"),
     )
 
     bot.reply_to(
@@ -1150,8 +1221,8 @@ def on_allocate_mode(call: types.CallbackQuery):
     else:
         state.alloc_mode = "max_yellow"
         prompt = (
-            "Режим <b>максимум жовтих</b> обрано. Надішліть файл <b>result.xlsx</b>. "
-            "Цей режим не питатиме про бюджет — одразу перерахує мінімальний spend."
+            "Режим <b>максимум жовтих</b> (цілі з <code>Total+%</code>) обрано. Надішліть файл <b>result.xlsx</b>. "
+            "Бюджет береться з колонок <code>Total+%</code>, тож нічого вводити вручну не потрібно."
         )
 
     state.phase = "WAIT_ALLOC_RESULT"
