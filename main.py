@@ -759,7 +759,9 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
       - кожен рядок має цільовий spend у колонці "Total+%" (верхня межа);
       - доступний глобальний бюджет = вся поточна сума в колонці "Total spend";
       - розподіл іде за зростанням Target: спершу переводимо green у yellow,
-        потім (якщо лишилися кошти) насичуємо жовті в межах CPA < target×YELLOW_MULT і нижче межі target×RED_MULT.
+        потім (якщо лишилися кошти) насичуємо жовті в межах CPA < target×YELLOW_MULT
+        та нижче межі target×RED_MULT, а за наявності залишку доводимо рядки до
+        червоного порогу (red_ceiling).
     Повертає оновлену таблицю, фактично розподілений бюджет та фінальні значення spend по рядках.
     """
 
@@ -782,8 +784,8 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     row_allowance = pd.to_numeric(row_allowance, errors="coerce").clip(lower=0.0).fillna(0.0)
 
     available_budget = float(F.sum())
-
-    spend_order = F.sort_values(ascending=True).index.tolist()
+    order = T.sort_values(ascending=True).index.tolist()
+    order_by_total_spend = F.sort_values(ascending=True).index.tolist()
     alloc = pd.Series(0.0, index=dfw.index, dtype=float)
     rem = available_budget
 
@@ -846,6 +848,28 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
             if allowance_left <= 1e-9:
                 continue
             give = min(rem, head, allowance_left)
+            if give <= 1e-9:
+                continue
+            alloc.at[idx] += give
+            rem -= give
+
+    # Крок 3: доводимо до червоного стелі, якщо бюджет ще лишився
+    if rem > 1e-9:
+        red_caps = thresholds["red_ceiling"].fillna(0.0)
+        for idx in order_by_total_spend:
+            if rem <= 1e-9:
+                break
+            if float(E.at[idx]) <= 0:
+                continue
+            allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
+            if allowance_left <= 1e-9:
+                continue
+            cap = min(float(red_caps.at[idx]), float(row_allowance.at[idx]))
+            current = float(alloc.at[idx])
+            need = cap - current
+            if need <= 1e-9:
+                continue
+            give = min(rem, need, allowance_left)
             if give <= 1e-9:
                 continue
             alloc.at[idx] += give
@@ -1190,7 +1214,7 @@ def on_document(message: types.Message):
                 )
 
                 summary = (
-                    "Режим: максимум жовтих (Total+% цілі).\n"
+                    "Режим: максимум жовтих (Total+% цілі) з доведенням до red-ceiling.\n"
                     f"Початковий бюджет (сума Total spend): {starting_budget:.2f}; розподілено: {used_budget:.2f}; невикористано: {unused_budget:.2f}\n"
                     f"Жовтих після розподілу: {yellow_after}/{total_posE} (зел.→жовт.: {green_to_yellow})"
                 )
