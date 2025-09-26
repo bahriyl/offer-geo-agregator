@@ -28,6 +28,23 @@ EPS = 1e-12
 EPS_YEL = 1e-6
 
 
+# ===================== FORMULA HELPERS =====================
+
+
+def _build_yellow_formula(row: int = 2) -> str:
+    """Return the Excel conditional formatting formula for the yellow status."""
+
+    row_ref = str(row)
+    return (
+        f"AND($E{row_ref}>0,OR("
+        f"AND($L{row_ref}>{DEPOSIT_GREEN_MIN:.0f},$H{row_ref}>=INT($I{row_ref}),"
+        f"$H{row_ref}<$I{row_ref}*{YELLOW_MULT:.2f},$H{row_ref}<=$I{row_ref}*{RED_MULT:.1f}),"
+        f"AND($L{row_ref}<={DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<INT($I{row_ref}),"
+        f"$H{row_ref}<=$I{row_ref}*{RED_MULT:.1f})"
+        "))"
+    )
+
+
 # ===================== STATE =====================
 class UserState:
     def __init__(self):
@@ -1178,13 +1195,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
         ws.conditional_formatting.add(data_range, FormulaRule(formula=["$E2=0"], fill=grey, stopIfTrue=True))
         ws.conditional_formatting.add(data_range,
                                       FormulaRule(formula=[f"AND($E2>0,$H2<=INT($I2),$L2>{DEPOSIT_GREEN_MIN:.0f})"], fill=green, stopIfTrue=True))
-        yellow_formula = (
-            "AND($E2>0,OR("
-            f"AND($L2>{DEPOSIT_GREEN_MIN:.0f},$H2>=INT($I2),$H2<$I2*{YELLOW_MULT:.2f}),"
-            f"AND($L2<={DEPOSIT_GREEN_MIN:.0f},$H2<INT($I2)),"
-            f"AND($H2<=$I2*{RED_MULT:.1f})"
-            "))"
-        )
+        yellow_formula = _build_yellow_formula()
         ws.conditional_formatting.add(data_range, FormulaRule(formula=[yellow_formula], fill=yellow,
                                                               stopIfTrue=True))
         ws.conditional_formatting.add(data_range,
@@ -1838,13 +1849,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
             data_range,
             FormulaRule(formula=[f"AND($E2>0,$H2<=INT($I2),$L2>{DEPOSIT_GREEN_MIN:.0f})"], fill=green, stopIfTrue=True),
         )
-        yellow_formula = (
-            "AND($E2>0,OR("
-            f"AND($L2>{DEPOSIT_GREEN_MIN:.0f},$H2>=INT($I2),$H2<$I2*{YELLOW_MULT:.2f}),"
-            f"AND($L2<={DEPOSIT_GREEN_MIN:.0f},$H2<INT($I2)),"
-            f"AND($H2<=$I2*{RED_MULT:.1f})"
-            "))"
-        )
+        yellow_formula = _build_yellow_formula()
         ws.conditional_formatting.add(
             data_range,
             FormulaRule(formula=[yellow_formula], fill=yellow, stopIfTrue=True),

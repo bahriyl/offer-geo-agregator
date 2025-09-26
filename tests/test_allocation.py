@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from openpyxl import load_workbook
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -254,3 +255,47 @@ def test_read_result_allocation_table_handles_formula_total_plus_percent(tmp_pat
     assert used_budget > 0.0
     assert alloc_vec.iloc[0] > 0.0
     assert result_df.loc[parsed.index[0], "Allocated extra"] >= 0.0
+
+
+def test_yellow_formula_written_to_excel_matches_helper():
+    os.environ["BOT_TOKEN"] = "456:FORMULA"
+    main_mod = importlib.reload(importlib.import_module("main"))
+
+    df = pd.DataFrame(
+        {
+            "Subid": ["s1"],
+            "Offer ID": ["o1"],
+            "Назва Офферу": ["Offer"],
+            "ГЕО": ["Geo"],
+            "FTD qty": [5],
+            "Total spend": [100.0],
+            "Total Dep Amount": [50.0],
+        }
+    )
+
+    bio = io.BytesIO()
+    main_mod.write_result_like_excel_with_new_spend(
+        bio,
+        df,
+        pd.Series([0.0]),
+        overwrite_total_spend=True,
+    )
+    bio.seek(0)
+    wb = load_workbook(bio)
+    ws = wb["Result"]
+
+    expected_formula = main_mod._build_yellow_formula()
+    formulas = []
+    for rules in ws.conditional_formatting._cf_rules.values():
+        for rule in rules:
+            if getattr(rule, "type", None) != "expression":
+                continue
+            formula_field = getattr(rule, "formula", None)
+            if not formula_field:
+                continue
+            if isinstance(formula_field, (list, tuple)):
+                formulas.extend(formula_field)
+            else:
+                formulas.append(formula_field)
+
+    assert expected_formula in formulas
