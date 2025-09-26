@@ -650,7 +650,9 @@ def _fmt(v: float, suf: str = "", nan_text: str = "-") -> str:
 def build_allocation_explanation(df_source: pd.DataFrame,
                                  alloc_vec: pd.Series,
                                  budget: float,
-                                 max_lines: int = 20) -> str:
+                                 max_lines: int = 20,
+                                 *,
+                                 alloc_is_delta: bool = True) -> str:
     """
     Створює текстовий звіт:
       - скільки бюджету використано і залишок
@@ -673,8 +675,16 @@ def build_allocation_explanation(df_source: pd.DataFrame,
     K = pd.to_numeric(df.get("Total Dep Amount", 0), errors="coerce").fillna(0.0)
     targets, _ = _extract_targets(df)
 
-    alloc = pd.to_numeric(alloc_vec, errors="coerce").reindex(df.index).fillna(0.0)
-    F_new = (F + alloc)
+    alloc_input = pd.to_numeric(alloc_vec, errors="coerce").reindex(df.index).fillna(0.0)
+
+    if alloc_is_delta:
+        alloc_delta = alloc_input
+        F_new = F + alloc_delta
+        used = float(alloc_delta.sum())
+    else:
+        F_new = alloc_input
+        alloc_delta = F_new - F
+        used = float(F_new.sum())
 
     # Статуси ДО/ПІСЛЯ
     before = [
@@ -688,7 +698,6 @@ def build_allocation_explanation(df_source: pd.DataFrame,
 
     # Метрики
     total_budget = float(budget)
-    used = float(alloc.sum())
     left = max(0.0, total_budget - used)
 
     yellow_before = sum(1 for s in before if s == "Yellow")
@@ -697,8 +706,8 @@ def build_allocation_explanation(df_source: pd.DataFrame,
 
     # Побудова списку рядків з алокацією
     rows = []
-    for i in alloc.index:
-        if alloc[i] <= 0:
+    for i in alloc_delta.index:
+        if alloc_delta[i] <= 0:
             continue
 
         Ei = float(E[i]);
@@ -716,12 +725,12 @@ def build_allocation_explanation(df_source: pd.DataFrame,
 
         line = (
             f"- {str(offer[i]) or ''} / {str(name[i]) or ''} / {str(geo[i]) or ''}: "
-            f"+{alloc[i]:.2f} → Total Spend {Fi:.2f}→{Fni:.2f}; "
+            f"+{alloc_delta[i]:.2f} → Total Spend {Fi:.2f}→{Fni:.2f}; "
             f"CPA {_fmt(H_before)}→{_fmt(H_after)}, "
             f"My deposit amount {_fmt(L_before, '%')}→{_fmt(L_after, '%')} | "
             f"{before[i]} → {after[i]}"
         )
-        rows.append((alloc[i], line))
+        rows.append((alloc_delta[i], line))
 
     # Сортуємо за найбільшою алокацією і обрізаємо
     rows.sort(key=lambda x: (-x[0], x[1]))
@@ -748,10 +757,10 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     """
     Режим «максимум жовтих» з автоматичним бюджетом:
       - кожен рядок має цільовий spend у колонці "Total+%" (верхня межа);
-      - доступний глобальний бюджет = сума позитивних (Target - Total spend);
+      - доступний глобальний бюджет = вся поточна сума в колонці "Total spend";
       - розподіл іде за зростанням Target: спершу переводимо green у yellow,
         потім (якщо лишилися кошти) насичуємо жовті в межах CPA < target×YELLOW_MULT і нижче межі target×RED_MULT.
-    Повертає оновлену таблицю, фактично розподілений бюджет та серію дельт по рядках.
+    Повертає оновлену таблицю, фактично розподілений бюджет та фінальні значення spend по рядках.
     """
 
     dfw = df.copy()
@@ -765,20 +774,17 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     thresholds = _build_threshold_table(E, K, targets, target_ints)
 
     stop_before_red = thresholds["red_ceiling"].fillna(0.0)
-    target_delta = (T - F).clip(lower=0.0)
-    red_headroom = (stop_before_red - F).clip(lower=0.0)
 
     row_allowance = pd.Series(
-        np.minimum(target_delta.to_numpy(), red_headroom.to_numpy()),
+        np.minimum(T.to_numpy(), stop_before_red.to_numpy()),
         index=dfw.index,
     )
-    row_allowance = pd.to_numeric(row_allowance, errors="coerce").fillna(0.0)
+    row_allowance = pd.to_numeric(row_allowance, errors="coerce").clip(lower=0.0).fillna(0.0)
 
-    available_budget = float(target_delta.sum())
+    available_budget = float(F.sum())
 
     order = T.sort_values(ascending=True).index.tolist()
     alloc = pd.Series(0.0, index=dfw.index, dtype=float)
-    F_now = F.copy()
     rem = available_budget
 
     # Крок 1: переводимо green у yellow
@@ -792,14 +798,14 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
         if ei <= 0:
             continue
         ki = float(K.at[idx])
-        f_cur = float(F_now.at[idx])
+        f_cur = float(alloc.at[idx])
         status_now = _classify_status(ei, f_cur, ki, float(targets.at[idx]))
         if status_now != "Green":
             continue
         target_yellow = _compute_make_yellow_target(ei, f_cur, ki, thresholds.loc[idx])
         if target_yellow is None:
             continue
-        max_target = min(target_yellow, float(F.at[idx] + row_allowance.at[idx]))
+        max_target = min(target_yellow, float(row_allowance.at[idx]))
         need = max_target - f_cur
         if need <= 1e-9:
             continue
@@ -807,12 +813,11 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
         if give <= 1e-9:
             continue
         alloc.at[idx] += give
-        F_now.at[idx] += give
         rem -= give
 
     # Крок 2: насичуємо yellow в межах нових правил
     if rem > 1e-9:
-        F_mid = F + alloc
+        F_mid = alloc.copy()
         status_mid = pd.Series([
             _classify_status(float(E.at[i]), float(F_mid.at[i]), float(K.at[i]), float(targets.at[i]))
             for i in dfw.index
@@ -824,7 +829,7 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
             if not is_yellow_mid.at[idx]:
                 continue
             limit_val = _compute_yellow_limit(float(E.at[idx]), float(F_mid.at[idx]), float(K.at[idx]), thresholds.loc[idx])
-            limit_val = min(limit_val, float(F.at[idx] + row_allowance.at[idx]))
+            limit_val = min(limit_val, float(row_allowance.at[idx]))
             yellow_limit.at[idx] = max(limit_val, float(F_mid.at[idx]))
 
         headroom = (yellow_limit - F_mid).clip(lower=0.0)
@@ -844,17 +849,17 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
             alloc.at[idx] += give
             rem -= give
 
-    F_final = F + alloc
+    F_final = alloc
     statuses_final = pd.Series([
         _classify_status(float(E.at[i]), float(F_final.at[i]), float(K.at[i]), float(targets.at[i]))
         for i in dfw.index
     ], index=dfw.index)
 
-    dfw["Allocated extra"] = alloc
+    dfw["Allocated extra"] = F_final - F
     dfw["New Total spend"] = F_final
     dfw["Will be yellow"] = ["Yes" if statuses_final.at[i] == "Yellow" else "No" for i in dfw.index]
 
-    used = float(alloc.sum())
+    used = float(F_final.sum())
 
     return dfw, used, alloc
 
@@ -968,7 +973,11 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
     return dfw, summary, alloc
 
 
-def write_result_like_excel_with_new_spend(bio: io.BytesIO, df_source: pd.DataFrame, new_total_spend: pd.Series):
+def write_result_like_excel_with_new_spend(bio: io.BytesIO,
+                                           df_source: pd.DataFrame,
+                                           new_total_spend: pd.Series,
+                                           *,
+                                           overwrite_total_spend: bool = False):
     """
     Build an Excel sheet identical to result.xlsx structure:
     Columns (A..P):
@@ -997,7 +1006,10 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO, df_source: pd.DataFr
     # align by index; if shapes don't match, reindex new_total_spend to df_out
     new_total_spend = pd.to_numeric(new_total_spend, errors="coerce").fillna(0.0)
     new_total_spend = new_total_spend.reindex(df_out.index).fillna(0.0)
-    df_out["Total spend"] = (df_out["Total spend"] + new_total_spend).round(2)
+    if overwrite_total_spend:
+        df_out["Total spend"] = new_total_spend.round(2)
+    else:
+        df_out["Total spend"] = (df_out["Total spend"] + new_total_spend).round(2)
 
     # Ensure missing columns exist as blanks
     for col in final_cols:
@@ -1156,16 +1168,15 @@ def on_document(message: types.Message):
                 _alloc_df, used_budget, alloc_vec = compute_allocation_max_yellow(state.alloc_df)
 
                 total_spend = pd.to_numeric(state.alloc_df.get("Total spend", 0.0), errors="coerce").fillna(0.0)
-                total_target = pd.to_numeric(state.alloc_df.get("Total+%", 0.0), errors="coerce").fillna(0.0)
-                available_budget = float((total_target - total_spend).clip(lower=0.0).sum())
-                unused_budget = max(0.0, available_budget - used_budget)
+                starting_budget = float(total_spend.sum())
+                unused_budget = max(0.0, starting_budget - used_budget)
 
                 df_norm = state.alloc_df.copy()
                 df_norm.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in df_norm.columns]
                 E = pd.to_numeric(df_norm.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
                 K = pd.to_numeric(df_norm.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
                 F_before = total_spend
-                F_after = (F_before + pd.to_numeric(alloc_vec, errors="coerce").reindex(df_norm.index).fillna(0.0))
+                F_after = pd.to_numeric(alloc_vec, errors="coerce").reindex(df_norm.index).fillna(0.0)
 
                 before_status = [_classify_status(float(E[i]), float(F_before[i]), float(K[i])) for i in df_norm.index]
                 after_status = [_classify_status(float(E[i]), float(F_after[i]), float(K[i])) for i in df_norm.index]
@@ -1178,12 +1189,17 @@ def on_document(message: types.Message):
 
                 summary = (
                     "Режим: максимум жовтих (Total+% цілі).\n"
-                    f"Цільовий бюджет: {available_budget:.2f}; використано: {used_budget:.2f}; невикористано: {unused_budget:.2f}\n"
+                    f"Початковий бюджет (сума Total spend): {starting_budget:.2f}; розподілено: {used_budget:.2f}; невикористано: {unused_budget:.2f}\n"
                     f"Жовтих після розподілу: {yellow_after}/{total_posE} (зел.→жовт.: {green_to_yellow})"
                 )
 
                 bio = io.BytesIO()
-                write_result_like_excel_with_new_spend(bio, state.alloc_df, new_total_spend=alloc_vec)
+                write_result_like_excel_with_new_spend(
+                    bio,
+                    state.alloc_df,
+                    new_total_spend=alloc_vec,
+                    overwrite_total_spend=True,
+                )
 
                 bio.seek(0)
                 bot.send_document(
@@ -1193,7 +1209,13 @@ def on_document(message: types.Message):
                     caption=summary,
                 )
 
-                explanation = build_allocation_explanation(state.alloc_df, alloc_vec, used_budget, max_lines=20)
+                explanation = build_allocation_explanation(
+                    state.alloc_df,
+                    alloc_vec,
+                    starting_budget,
+                    max_lines=20,
+                    alloc_is_delta=False,
+                )
                 bot.send_message(chat_id, explanation)
 
                 state.phase = "WAIT_MAIN"
