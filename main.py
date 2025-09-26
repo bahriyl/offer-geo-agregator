@@ -985,7 +985,14 @@ def on_skip_offer(call: types.CallbackQuery):
     else:
         # якщо оферів більше немає — генеруємо фінальний файл
         try:
-            send_final_table(call.message, state)
+            final_df = build_final_output(state)
+            if final_df.empty:
+                bot.send_message(
+                    chat_id,
+                    "ℹ️ Після пропуску всіх оферів не залишилось даних для експорту.",
+                )
+            else:
+                send_final_table(call.message, final_df)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Помилка під час формування файлу: <code>{e}</code>")
 
