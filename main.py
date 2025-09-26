@@ -26,6 +26,8 @@ RED_MULT = 1.8
 DEPOSIT_GREEN_MIN = 39.0
 EPS = 1e-12
 EPS_YEL = 1e-6
+CPA_TOL = 1e-9
+DEPOSIT_TOL = 1e-9
 
 
 # ===================== STATE =====================
@@ -699,19 +701,27 @@ def _classify_status(E: float, F: float, K: float, target: Optional[float] = Non
     cpa = _calc_cpa(E, F)
     deposit_pct = _calc_deposit_pct(K, F)
 
-    if (cpa <= target_int + EPS) and (deposit_pct > DEPOSIT_GREEN_MIN + EPS):
+    deposit_green_cutoff = DEPOSIT_GREEN_MIN + DEPOSIT_TOL
+    yellow_upper_bound = target_val * YELLOW_MULT
+    red_lower_bound = target_val * RED_MULT
+
+    if (deposit_pct > deposit_green_cutoff) and (cpa <= target_int + CPA_TOL):
         return "Green"
 
-    if cpa > target_val * RED_MULT + EPS:
+    if cpa >= red_lower_bound - CPA_TOL:
         return "Red"
 
-    if (deposit_pct > DEPOSIT_GREEN_MIN + EPS) and (cpa >= target_int - EPS) and (cpa < target_val * YELLOW_MULT - EPS):
+    if deposit_pct > deposit_green_cutoff:
+        if cpa >= yellow_upper_bound - CPA_TOL:
+            return "Red"
+        if cpa >= target_int - CPA_TOL:
+            return "Yellow"
+        return "Red"
+
+    if cpa <= target_int - CPA_TOL:
         return "Yellow"
 
-    if (deposit_pct <= DEPOSIT_GREEN_MIN + EPS) and (cpa < target_int - EPS):
-        return "Yellow"
-
-    return "Yellow"
+    return "Red"
 
 
 def _fmt(v: float, suf: str = "", nan_text: str = "-") -> str:
