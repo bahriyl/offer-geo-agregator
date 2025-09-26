@@ -215,22 +215,61 @@ def test_allocation_parses_currency_strings_with_non_standard_formats():
     assert alloc_vec.index.tolist() == df.index.tolist()
 
 
-def test_classify_status_flags_red_when_cpa_reaches_thresholds():
+def test_classify_status_uses_red_cutoff_from_below_and_excel_rule_matches():
     os.environ["BOT_TOKEN"] = "147:STATUS"
     main_mod = importlib.reload(importlib.import_module("main"))
 
     e = 10.0
     target = 8.0
-    # CPA exactly at the integer target with deposits below the green threshold.
-    f_at_target = (target * e) / 1.3
-    low_deposit = 30.0  # yields deposit % below 39
-    assert main_mod._classify_status(e, f_at_target, low_deposit, target) == "Red"
+    red_cutoff = target * main_mod.RED_MULT
 
-    # Deposits above the green threshold but CPA breaching the yellow ceiling should also be red.
-    cpa_beyond_yellow = target * main_mod.YELLOW_MULT + 0.05
-    f_beyond_yellow = (cpa_beyond_yellow * e) / 1.3
+    cpa_below = red_cutoff - 1e-4
+    f_below = (cpa_below * e) / 1.3
     high_deposit = 50.0
-    assert main_mod._classify_status(e, f_beyond_yellow, high_deposit, target) == "Red"
+    assert main_mod._classify_status(e, f_below, high_deposit, target) == "Red"
+
+    cpa_above = red_cutoff + 1e-4
+    f_above = (cpa_above * e) / 1.3
+    status_above = main_mod._classify_status(e, f_above, high_deposit, target)
+    assert status_above == "Grey"
+
+    df = pd.DataFrame(
+        {
+            "Subid": ["s_below", "s_above"],
+            "Offer ID": ["o1", "o2"],
+            "Назва Офферу": ["Offer", "Offer"],
+            "ГЕО": ["G1", "G2"],
+            "FTD qty": [e, e],
+            "Total spend": [0.0, 0.0],
+            "Total Dep Amount": [1.3 * f_below * 0.5, 1.3 * f_above * 0.5],
+        }
+    )
+
+    bio = io.BytesIO()
+    new_spend = pd.Series([f_below, f_above], index=df.index)
+    main_mod.write_result_like_excel_with_new_spend(
+        bio,
+        df,
+        new_spend,
+        overwrite_total_spend=True,
+    )
+    bio.seek(0)
+    wb = load_workbook(bio)
+    ws = wb["Result"]
+
+    red_rule_formulae = []
+    for rules in ws.conditional_formatting._cf_rules.values():
+        for rule in rules:
+            if getattr(rule, "type", None) != "expression":
+                continue
+            formulas = getattr(rule, "formula", [])
+            if isinstance(formulas, str):
+                formulas = [formulas]
+            for formula in formulas:
+                if "$H2<$I2" in formula:
+                    red_rule_formulae.append(formula)
+
+    assert any(f"$H2<$I2*{main_mod.RED_MULT:.1f}" in f for f in red_rule_formulae)
 
 
 def test_read_result_allocation_table_handles_formula_total_plus_percent(tmp_path):

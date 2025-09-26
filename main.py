@@ -40,9 +40,9 @@ def _build_yellow_formula(row: int = 2) -> str:
     return (
         f"AND($E{row_ref}>0,OR("
         f"AND($L{row_ref}>{DEPOSIT_GREEN_MIN:.0f},$H{row_ref}>=INT($I{row_ref}),"
-        f"$H{row_ref}<$I{row_ref}*{YELLOW_MULT:.2f},$H{row_ref}<=$I{row_ref}*{RED_MULT:.1f}),"
+        f"$H{row_ref}<$I{row_ref}*{YELLOW_MULT:.2f},$H{row_ref}<$I{row_ref}*{RED_MULT:.1f}),"
         f"AND($L{row_ref}<={DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<INT($I{row_ref}),"
-        f"$H{row_ref}<=$I{row_ref}*{RED_MULT:.1f})"
+        f"$H{row_ref}<$I{row_ref}*{RED_MULT:.1f})"
         "))"
     )
 
@@ -720,25 +720,22 @@ def _classify_status(E: float, F: float, K: float, target: Optional[float] = Non
 
     deposit_green_cutoff = DEPOSIT_GREEN_MIN + DEPOSIT_TOL
     yellow_upper_bound = target_val * YELLOW_MULT
-    red_lower_bound = target_val * RED_MULT
+    red_upper_bound = target_val * RED_MULT
 
     if (deposit_pct > deposit_green_cutoff) and (cpa <= target_int + CPA_TOL):
         return "Green"
 
-    if cpa >= red_lower_bound - CPA_TOL:
-        return "Red"
-
     if deposit_pct > deposit_green_cutoff:
-        if cpa >= yellow_upper_bound - CPA_TOL:
-            return "Red"
-        if cpa >= target_int - CPA_TOL:
+        if (cpa >= target_int - CPA_TOL) and (cpa < yellow_upper_bound - CPA_TOL):
             return "Yellow"
+    else:
+        if cpa <= target_int - CPA_TOL:
+            return "Yellow"
+
+    if cpa < red_upper_bound - CPA_TOL:
         return "Red"
 
-    if cpa <= target_int - CPA_TOL:
-        return "Yellow"
-
-    return "Red"
+    return "Grey"
 
 
 def _fmt(v: float, suf: str = "", nan_text: str = "-") -> str:
@@ -841,7 +838,7 @@ def build_allocation_explanation(df_source: pd.DataFrame,
         f"Розподіл бюджету: {used:.2f} / {total_budget:.2f} використано; залишок {left:.2f}\n"
         f"Жовтих ДО/ПІСЛЯ: {yellow_before} → {yellow_after} (зел.→жовт.: {green_to_yellow})\n"
         f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — або депозит>{DEPOSIT_GREEN_MIN:.0f}% із CPA в діапазоні [INT(target); target×{YELLOW_MULT:.2f}),"
-        f" або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target); red — CPA>target×{RED_MULT:.1f}."
+        f" або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target); red — CPA<target×{RED_MULT:.1f}."
     )
 
     header = html.escape(header)
@@ -1095,7 +1092,7 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
         f"Бюджет: {budget:.2f}\n"
         f"Жовтих після розподілу: {kept_yellow}/{total_posE}\n"
         f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — тримаємо CPA нижче target×{YELLOW_MULT:.2f} "
-        f"(або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target)), red — CPA>target×{RED_MULT:.1f}."
+        f"(або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target)), red — CPA<target×{RED_MULT:.1f}."
     )
     return dfw, summary, alloc
 
@@ -1209,7 +1206,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
         ws.conditional_formatting.add(data_range, FormulaRule(formula=[yellow_formula], fill=yellow,
                                                               stopIfTrue=True))
         ws.conditional_formatting.add(data_range,
-                                      FormulaRule(formula=[f"AND($E2>0,$H2>$I2*{RED_MULT:.1f})"], fill=red, stopIfTrue=True))
+                                      FormulaRule(formula=[f"AND($E2>0,$H2<$I2*{RED_MULT:.1f})"], fill=red, stopIfTrue=True))
 
 
 # ===================== BOT HANDLERS =====================
@@ -1866,7 +1863,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         )
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=[f"AND($E2>0,$H2>$I2*{RED_MULT:.1f})"], fill=red, stopIfTrue=True),
+            FormulaRule(formula=[f"AND($E2>0,$H2<$I2*{RED_MULT:.1f})"], fill=red, stopIfTrue=True),
         )
 
     bio.seek(0)
