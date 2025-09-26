@@ -214,6 +214,24 @@ def test_allocation_parses_currency_strings_with_non_standard_formats():
     assert alloc_vec.index.tolist() == df.index.tolist()
 
 
+def test_classify_status_flags_red_when_cpa_reaches_thresholds():
+    os.environ["BOT_TOKEN"] = "147:STATUS"
+    main_mod = importlib.reload(importlib.import_module("main"))
+
+    e = 10.0
+    target = 8.0
+    # CPA exactly at the integer target with deposits below the green threshold.
+    f_at_target = (target * e) / 1.3
+    low_deposit = 30.0  # yields deposit % below 39
+    assert main_mod._classify_status(e, f_at_target, low_deposit, target) == "Red"
+
+    # Deposits above the green threshold but CPA breaching the yellow ceiling should also be red.
+    cpa_beyond_yellow = target * main_mod.YELLOW_MULT + 0.05
+    f_beyond_yellow = (cpa_beyond_yellow * e) / 1.3
+    high_deposit = 50.0
+    assert main_mod._classify_status(e, f_beyond_yellow, high_deposit, target) == "Red"
+
+
 def test_read_result_allocation_table_handles_formula_total_plus_percent(tmp_path):
     os.environ["BOT_TOKEN"] = "456:FORM"
     main_mod = importlib.reload(importlib.import_module("main"))
