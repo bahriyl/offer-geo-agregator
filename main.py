@@ -959,7 +959,7 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
     dfw["New Total spend"] = F_final
     dfw["Will be yellow"] = ["Yes" if statuses_final.at[i] == "Yellow" else "No" for i in dfw.index]
 
-    summary = (
+    summary = html.escape(
         f"Бюджет: {budget:.2f}\n"
         f"Жовтих після розподілу: {kept_yellow}/{total_posE}\n"
         f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — тримаємо CPA нижче target×{YELLOW_MULT:.2f} "
