@@ -448,6 +448,53 @@ def read_additional_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     return df
 
 
+def read_result_allocation_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    """Parse result.xlsx (sheet Result) and normalise required columns."""
+    if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
+        raise ValueError("Очікую файл Excel (result.xlsx) з аркушем Result.")
+
+    engines = ["openpyxl", "calamine", "xlrd"]
+    errors = []
+    df = None
+    for engine in engines:
+        try:
+            bio = io.BytesIO(file_bytes)
+            df = pd.read_excel(bio, sheet_name="Result", engine=engine)
+            break
+        except Exception as e:
+            errors.append(f"{engine}: {e}")
+
+    if df is None:
+        raise ValueError(
+            "Не вдалося прочитати аркуш Result у файлі. Спробуйте ще раз або перевірте, що файл — result.xlsx."
+            + (f" Деталі: {'; '.join(errors)}" if errors else "")
+        )
+
+    df.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in df.columns]
+
+    def _ensure_column(label: str, required: bool) -> None:
+        mapping = match_columns(df.columns, [label])
+        if mapping:
+            actual = mapping[label]
+            if actual != label:
+                df.rename(columns={actual: label}, inplace=True)
+            return
+        if required:
+            raise ValueError(f"У файлі немає очікуваної колонки \"{label}\" на аркуші Result.")
+
+    for optional_col in ["Subid", "Offer ID", "Назва Офферу", "ГЕО"]:
+        _ensure_column(optional_col, required=False)
+
+    for required_col in ["FTD qty", "Total spend", "Total Dep Amount"]:
+        _ensure_column(required_col, required=True)
+
+    df["FTD qty"] = pd.to_numeric(df.get("FTD qty", 0), errors="coerce").fillna(0).astype(int)
+    for col in ["Total spend", "Total Dep Amount"]:
+        df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce").fillna(0.0).round(2)
+
+    return df
+
+
 # ===================== HELPERS =====================
 
 def ask_additional_table_with_skip(message: types.Message, state: UserState):
@@ -874,6 +921,23 @@ def on_document(message: types.Message):
         elif state.phase == "WAIT_ADDITIONAL":
             df = read_additional_table(file_bytes, filename)
             handle_additional_table(message, state, df)
+        elif state.phase == "WAIT_ALLOC_RESULT":
+            try:
+                df = read_result_allocation_table(file_bytes, filename)
+            except ValueError as ve:
+                bot.reply_to(
+                    message,
+                    (
+                        f"❌ Не вдалося опрацювати <b>{filename}</b>:\n"
+                        f"<code>{ve}</code>\n\n"
+                        "Будь ласка, переконайтеся, що надсилаєте згенерований ботом result.xlsx."
+                    ),
+                )
+                return
+
+            state.alloc_df = df
+            state.phase = "WAIT_ALLOC_BUDGET"
+            bot.reply_to(message, "✅ Файл result.xlsx отримано. Введіть бюджет (наприклад: 200 або 200.5).")
         else:
             bot.reply_to(message, "⚠️ Несподівана фаза. Спробуйте ще раз із головної таблиці.")
     except ValueError as ve:
