@@ -101,6 +101,43 @@ def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip().lower()
 
 
+def _normalize_money(series: pd.Series) -> pd.Series:
+    """Normalise money-like strings into numeric values."""
+    if series is None:
+        return pd.Series(dtype=float)
+
+    if isinstance(series, pd.Series):
+        ser = series.copy()
+    else:
+        ser = pd.Series(series)
+    if ser.empty:
+        return pd.to_numeric(ser, errors="coerce")
+
+    ser = ser.astype("string")
+    ser = ser.str.replace("\u00a0", "", regex=False)
+    ser = ser.str.replace("\u202f", "", regex=False)
+    ser = ser.str.strip()
+    ser = ser.str.replace(r"\s+", "", regex=True)
+    ser = ser.str.replace(r"[^0-9,\.\-]", "", regex=True)
+
+    def _harmonise_decimal(value):
+        if value is pd.NA:
+            return value
+        if value is None:
+            return pd.NA
+        text = str(value)
+        if text == "" or text in {"-", ".", ",", "-.", "-,"}:
+            return pd.NA
+        if "," in text and "." in text:
+            text = text.replace(",", "")
+        elif "," in text:
+            text = text.replace(",", ".")
+        return text
+
+    ser = ser.map(_harmonise_decimal)
+    return pd.to_numeric(ser, errors="coerce")
+
+
 def build_country_map_uk_to_en() -> Dict[str, str]:
     m = {
         "Бенін": "Benin",
@@ -494,7 +531,8 @@ def read_result_allocation_table(file_bytes: bytes, filename: str) -> pd.DataFra
 
     df["FTD qty"] = pd.to_numeric(df.get("FTD qty", 0), errors="coerce").fillna(0).astype(int)
     for col in ["Total spend", "Total Dep Amount"]:
-        df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce").fillna(0.0).round(2)
+        series = df.get(col, pd.Series(0.0, index=df.index))
+        df[col] = _normalize_money(series).fillna(0.0).round(2)
 
     df["Total+%"] = pd.to_numeric(df.get("Total+%", 0.0), errors="coerce").fillna(0.0)
 
@@ -671,8 +709,8 @@ def build_allocation_explanation(df_source: pd.DataFrame,
     name = df.get("Назва Офферу", pd.Series([""] * len(df)))
     geo = df.get("ГЕО", pd.Series([""] * len(df)))
     E = pd.to_numeric(df.get("FTD qty", 0), errors="coerce").fillna(0.0)
-    F = pd.to_numeric(df.get("Total spend", 0), errors="coerce").fillna(0.0)
-    K = pd.to_numeric(df.get("Total Dep Amount", 0), errors="coerce").fillna(0.0)
+    F = _normalize_money(df.get("Total spend", pd.Series(0.0, index=df.index))).fillna(0.0)
+    K = _normalize_money(df.get("Total Dep Amount", pd.Series(0.0, index=df.index))).fillna(0.0)
     targets, _ = _extract_targets(df)
 
     alloc_input = pd.to_numeric(alloc_vec, errors="coerce").reindex(df.index).fillna(0.0)
@@ -769,8 +807,8 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     dfw.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in dfw.columns]
 
     E = pd.to_numeric(dfw.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
-    F = pd.to_numeric(dfw.get("Total spend", 0.0), errors="coerce").fillna(0.0)
-    K = pd.to_numeric(dfw.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
+    F = _normalize_money(dfw.get("Total spend", pd.Series(0.0, index=dfw.index))).fillna(0.0)
+    K = _normalize_money(dfw.get("Total Dep Amount", pd.Series(0.0, index=dfw.index))).fillna(0.0)
     T = pd.to_numeric(dfw.get("Total+%", 0.0), errors="coerce").fillna(0.0)
     targets, target_ints = _extract_targets(dfw)
     thresholds = _build_threshold_table(E, K, targets, target_ints)
@@ -786,6 +824,7 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     available_budget = float(F.sum())
     order = T.sort_values(ascending=True).index.tolist()
     order_by_total_spend = F.sort_values(ascending=True).index.tolist()
+    spend_order = order_by_total_spend
     alloc = pd.Series(0.0, index=dfw.index, dtype=float)
     rem = available_budget
 
@@ -905,8 +944,8 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
 
     # Числові колонки
     E = pd.to_numeric(dfw["FTD qty"], errors="coerce").fillna(0.0)
-    F = pd.to_numeric(dfw["Total spend"], errors="coerce").fillna(0.0)
-    K = pd.to_numeric(dfw["Total Dep Amount"], errors="coerce").fillna(0.0)
+    F = _normalize_money(dfw.get("Total spend", pd.Series(0.0, index=dfw.index))).fillna(0.0)
+    K = _normalize_money(dfw.get("Total Dep Amount", pd.Series(0.0, index=dfw.index))).fillna(0.0)
     targets, target_ints = _extract_targets(dfw)
     thresholds = _build_threshold_table(E, K, targets, target_ints)
 
@@ -1025,8 +1064,12 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
 
     # Coerce numbers
     df_out["FTD qty"] = pd.to_numeric(df_out.get("FTD qty", 0), errors="coerce").fillna(0)
-    df_out["Total spend"] = pd.to_numeric(df_out.get("Total spend", 0), errors="coerce").fillna(0.0)
-    df_out["Total Dep Amount"] = pd.to_numeric(df_out.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
+    df_out["Total spend"] = _normalize_money(
+        df_out.get("Total spend", pd.Series(0.0, index=df_out.index))
+    ).fillna(0.0)
+    df_out["Total Dep Amount"] = _normalize_money(
+        df_out.get("Total Dep Amount", pd.Series(0.0, index=df_out.index))
+    ).fillna(0.0)
 
     # Apply new spend
     # align by index; if shapes don't match, reindex new_total_spend to df_out
@@ -1048,7 +1091,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
     # Round numeric display columns
     df_out["FTD qty"] = pd.to_numeric(df_out["FTD qty"], errors="coerce").fillna(0).astype(int)
     for col in ["Total spend", "Total Dep Amount"]:
-        df_out[col] = pd.to_numeric(df_out[col], errors="coerce").round(2)
+        df_out[col] = _normalize_money(df_out[col]).round(2)
 
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df_out.to_excel(writer, index=False, sheet_name="Result")
@@ -1193,7 +1236,9 @@ def on_document(message: types.Message):
             elif state.alloc_mode == "max_yellow":
                 _alloc_df, used_budget, alloc_vec = compute_allocation_max_yellow(state.alloc_df)
 
-                total_spend = pd.to_numeric(state.alloc_df.get("Total spend", 0.0), errors="coerce").fillna(0.0)
+                total_spend = _normalize_money(
+                    state.alloc_df.get("Total spend", pd.Series(0.0, index=state.alloc_df.index))
+                ).fillna(0.0)
                 starting_budget = float(total_spend.sum())
                 unused_budget = max(0.0, starting_budget - used_budget)
 

@@ -1,16 +1,16 @@
+import importlib
 import os
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
-
-from pathlib import Path
-import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# Ensure the bot token is present before importing the bot module
 os.environ.setdefault("BOT_TOKEN", "0:TEST")
 
 from main import (  # noqa: E402
@@ -43,32 +43,19 @@ def test_allocation_continues_to_red_cap_when_budget_remains():
     red_caps = thresholds["red_ceiling"].astype(float)
     yellow_caps = thresholds["yellow_soft_ceiling"].astype(float)
 
-    # Переконуємося, що після доведення до жовтого ще є запас бюджету
     assert float(df["Total spend"].sum()) > float(yellow_caps.sum()) + 1e-6
 
-    # Алгоритм повинен довести рядки до red_ceiling, коли бюджет усе ще доступний
     np.testing.assert_allclose(alloc_vec.to_numpy(dtype=float), red_caps.to_numpy(dtype=float))
     assert used_budget == pytest.approx(float(red_caps.sum()))
     assert used_budget > float(yellow_caps.sum())
-=======
-import importlib
-import numpy as np
-import pandas as pd
-import pytest
-import sys
-from pathlib import Path
-
-ROOT_DIR = Path(__file__).resolve().parents[1]
-if str(ROOT_DIR) not in sys.path:
-    sys.path.insert(0, str(ROOT_DIR))
 
 
 def _prep_allocation_inputs(main_mod, df):
     dfw = df.copy()
     dfw.columns = [str(c).strip() for c in dfw.columns]
     E = pd.to_numeric(dfw.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
-    F = pd.to_numeric(dfw.get("Total spend", 0.0), errors="coerce").fillna(0.0)
-    K = pd.to_numeric(dfw.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
+    F = main_mod._normalize_money(dfw.get("Total spend", pd.Series(0.0, index=dfw.index))).fillna(0.0)
+    K = main_mod._normalize_money(dfw.get("Total Dep Amount", pd.Series(0.0, index=dfw.index))).fillna(0.0)
     T = pd.to_numeric(dfw.get("Total+%", 0.0), errors="coerce").fillna(0.0)
     targets, target_ints = main_mod._extract_targets(dfw)
     thresholds = main_mod._build_threshold_table(E, K, targets, target_ints)
@@ -120,7 +107,6 @@ def test_low_spend_row_receives_leftover_before_high_spend():
     spend_order = F.sort_values(ascending=True).index.tolist()
     alloc = pd.Series(0.0, index=df.index, dtype=float)
 
-    # First pass (no rows are green, so allocations remain zero)
     F_now = F.copy()
     for idx in spend_order:
         if rem <= 1e-9:
@@ -176,7 +162,6 @@ def test_low_spend_row_receives_leftover_before_high_spend():
     high_idx = F.idxmax()
     assert low_idx != high_idx
 
-    # Determine which index would receive the first leftover funds under the old ordering
     def _first_recipient(order):
         for idx in order:
             if headroom.at[idx] <= 1e-9:
@@ -194,8 +179,35 @@ def test_low_spend_row_receives_leftover_before_high_spend():
     assert first_old == high_idx
     assert first_new != first_old
 
-    # Verify actual allocation gives the low-spend row a positive share
     _, _, alloc_result = main_mod.compute_allocation_max_yellow(df)
     assert alloc_result.at[low_idx] > 0.0
     assert alloc_result.at[high_idx] > 0.0
-    assert alloc_result.at[low_idx] == pytest.approx(row_allowance.at[low_idx])
+    alloc_delta = alloc_result - F
+    assert alloc_delta.at[low_idx] == pytest.approx(row_allowance.at[low_idx])
+
+
+def test_allocation_parses_currency_strings_with_non_standard_formats():
+    os.environ["BOT_TOKEN"] = "789:XYZ"
+    main_mod = importlib.reload(importlib.import_module("main"))
+
+    df = pd.DataFrame(
+        {
+            "FTD qty": [20, 15, 12],
+            "Total spend": ["1\u00a0234,56", "1,234.56", "$500"],
+            "Total Dep Amount": ["800", "650", "$300"],
+            "Total+%": [2500, 2200, 1200],
+            "CPA Target": [8.0, 9.0, 10.0],
+        },
+        index=["nbsp_comma", "comma_dot", "currency"],
+    )
+
+    result_df, used_budget, alloc_vec = main_mod.compute_allocation_max_yellow(df)
+
+    expected = np.array([1234.56, 1234.56, 500.0])
+    parsed = main_mod._normalize_money(df.get("Total spend")).to_numpy(dtype=float)
+    np.testing.assert_allclose(parsed, expected, rtol=1e-9)
+
+    assert used_budget > 0.0
+    assert used_budget == pytest.approx(float(alloc_vec.sum()))
+    assert (alloc_vec.to_numpy(dtype=float) > 0.0).all()
+    assert alloc_vec.index.tolist() == df.index.tolist()
