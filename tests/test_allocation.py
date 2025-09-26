@@ -1,4 +1,5 @@
 import importlib
+import io
 import os
 import sys
 from pathlib import Path
@@ -211,3 +212,45 @@ def test_allocation_parses_currency_strings_with_non_standard_formats():
     assert used_budget == pytest.approx(float(alloc_vec.sum()))
     assert (alloc_vec.to_numpy(dtype=float) > 0.0).all()
     assert alloc_vec.index.tolist() == df.index.tolist()
+
+
+def test_read_result_allocation_table_handles_formula_total_plus_percent(tmp_path):
+    os.environ["BOT_TOKEN"] = "456:FORM"
+    main_mod = importlib.reload(importlib.import_module("main"))
+
+    source_df = pd.DataFrame(
+        {
+            "FTD qty": [25],
+            "Total spend": [180.0],
+            "Total Dep Amount": [120.0],
+            "Total+%": ["=B2*1.3"],
+            "CPA Target": [9.0],
+        }
+    )
+
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        source_df.to_excel(writer, sheet_name="Result", index=False)
+    file_bytes = bio.getvalue()
+
+    parsed = main_mod.read_result_allocation_table(file_bytes, "result.xlsx")
+    assert pytest.approx(parsed.at[0, "Total spend"], rel=1e-9) == 180.0
+    assert parsed.at[0, "Total+%"] > parsed.at[0, "Total spend"]
+
+    E = pd.to_numeric(parsed.get("FTD qty"), errors="coerce").fillna(0.0)
+    F = parsed["Total spend"].astype(float)
+    K = parsed["Total Dep Amount"].astype(float)
+    targets, target_ints = main_mod._extract_targets(parsed)
+    thresholds = main_mod._build_threshold_table(E, K, targets, target_ints)
+    stop_before_red = thresholds["red_ceiling"].fillna(0.0)
+    row_allowance = pd.Series(
+        np.minimum(parsed["Total+%"].to_numpy(dtype=float), stop_before_red.to_numpy(dtype=float)),
+        index=parsed.index,
+    ).clip(lower=0.0)
+
+    assert row_allowance.iloc[0] > 0.0
+
+    result_df, used_budget, alloc_vec = main_mod.compute_allocation_max_yellow(parsed)
+    assert used_budget > 0.0
+    assert alloc_vec.iloc[0] > 0.0
+    assert result_df.loc[parsed.index[0], "Allocated extra"] >= 0.0
