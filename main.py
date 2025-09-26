@@ -41,6 +41,7 @@ class UserState:
         # --- allocate flow state ---
         self.alloc_df: Optional[pd.DataFrame] = None  # parsed result.xlsx
         self.alloc_budget: Optional[float] = None
+        self.alloc_mode: Optional[str] = None  # "budget" or "max_yellow"
 
 
 user_states: Dict[int, UserState] = {}
@@ -622,6 +623,101 @@ def build_allocation_explanation(df_source: pd.DataFrame,
         ("\n\n…Список обрізано." if len(rows) > max_lines else "")
 
 
+def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, str, pd.Series]:
+    """
+    Розрахунок режиму «максимум жовтих»:
+      - шукаємо мінімальний додатковий spend, щоб перевести всі дозволені зелені рядки в жовті;
+      - не насичуємо жовті понад це (тобто відсутній крок B з compute_optimal_allocation).
+    """
+    dfw = df.copy()
+
+    E = pd.to_numeric(dfw["FTD qty"], errors="coerce").fillna(0.0)
+    F = pd.to_numeric(dfw["Total spend"], errors="coerce").fillna(0.0)
+    K = pd.to_numeric(dfw["Total Dep Amount"], errors="coerce").fillna(0.0)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        H = 1.3 * F / E.replace(0, np.nan)
+        L = 100.0 * K / (1.3 * F.replace(0, np.nan))
+
+    F_at_H = H_THRESH * E / 1.3
+    F_at_L = (100.0 * K) / (1.3 * L_THRESH)
+    F_cap = CPA_CAP * E / 1.3
+
+    grey_mask = (E <= 0)
+    green_mask = (~grey_mask) & (H <= H_THRESH + EPS) & (L > L_THRESH + EPS)
+
+    F_cross_H = F_at_H + EPS_YEL
+    F_cross_L = F_at_L + EPS_YEL
+
+    candidates = pd.DataFrame({
+        "F_now": F,
+        "F_cap": F_cap,
+        "F_cross_H": F_cross_H,
+        "F_cross_L": F_cross_L,
+        "E": E,
+        "K": K,
+    })
+
+    F_target = F.copy()
+
+    for i in candidates[green_mask].index:
+        Fi = float(candidates.at[i, "F_now"])
+        Fcap = float(candidates.at[i, "F_cap"])
+        Fh = float(candidates.at[i, "F_cross_H"])
+        Fl = float(candidates.at[i, "F_cross_L"])
+        Ei = float(E.at[i])
+        Ki = float(K.at[i])
+
+        options = []
+        for Ft in (Fh, Fl):
+            if np.isfinite(Ft) and Ft > Fi + EPS and Ft <= Fcap + EPS:
+                Ht = 1.3 * Ft / Ei if Ei > 0 else float("inf")
+                Lt = (100.0 * Ki) / (1.3 * Ft) if Ft > 0 else float("inf")
+                is_red = (Ht > H_THRESH + EPS) and (Lt <= L_THRESH + EPS)
+                if not is_red:
+                    options.append(Ft)
+
+        if options:
+            F_target.at[i] = min(options)
+        else:
+            F_target.at[i] = Fi
+
+    need_delta = (F_target - F).clip(lower=0.0)
+    alloc = need_delta.where(green_mask, 0.0)
+
+    F_final = F + alloc
+    with np.errstate(divide='ignore', invalid='ignore'):
+        H_final = 1.3 * F_final / E.replace(0, np.nan)
+        L_final = 100.0 * K / (1.3 * F_final.replace(0, np.nan))
+
+    still_green = (E > 0) & (H_final <= H_THRESH + EPS) & (L_final > L_THRESH + EPS)
+    still_yellow = (E > 0) & (((H_final <= H_THRESH + EPS) | (L_final > L_THRESH + EPS)) & (~still_green))
+
+    dfw["Allocated extra"] = alloc
+    dfw["New Total spend"] = F_final
+    dfw["Will be yellow"] = ["Yes" if x else "No" for x in still_yellow]
+
+    total_posE = int((E > 0).sum())
+    kept_yellow = int(still_yellow.sum())
+
+    before_status = [_classify_status(float(E[i]), float(F[i]), float(K[i])) for i in dfw.index]
+    after_status = [_classify_status(float(E[i]), float(F_final[i]), float(K[i])) for i in dfw.index]
+    green_to_yellow = sum(
+        1 for i in range(len(before_status)) if before_status[i] == "Green" and after_status[i] == "Yellow"
+    )
+
+    used = float(alloc.sum())
+
+    summary = (
+        "Режим: максимум жовтих\n"
+        f"Додатковий spend для переведення зелених: {used:.2f}\n"
+        f"Жовтих після розподілу: {kept_yellow}/{total_posE} (зел.→жовт.: {green_to_yellow})\n"
+        f"Правила: додаємо мінімальний spend (CPA≤{CPA_CAP:g}), щоб перевести всі дозволені зелені в жовті."
+    )
+
+    return dfw, summary, alloc
+
+
 def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.DataFrame, str, pd.Series]:
     """
     Нова послідовність:
@@ -921,7 +1017,20 @@ def on_document(message: types.Message):
         elif state.phase == "WAIT_ADDITIONAL":
             df = read_additional_table(file_bytes, filename)
             handle_additional_table(message, state, df)
+        elif state.phase == "WAIT_ALLOC_CHOICE":
+            bot.reply_to(message, "Спочатку оберіть режим розподілу за допомогою кнопок під повідомленням.")
+            return
         elif state.phase == "WAIT_ALLOC_RESULT":
+            if not state.alloc_mode:
+                bot.reply_to(
+                    message,
+                    "Режим розподілу не вибрано. Використай команду /allocate та обери потрібний режим.",
+                )
+                state.phase = "WAIT_MAIN"
+                state.alloc_df = None
+                state.alloc_mode = None
+                state.alloc_budget = None
+                return
             try:
                 df = read_result_allocation_table(file_bytes, filename)
             except ValueError as ve:
@@ -933,11 +1042,47 @@ def on_document(message: types.Message):
                         "Будь ласка, переконайтеся, що надсилаєте згенерований ботом result.xlsx."
                     ),
                 )
+                state.alloc_df = None
+                state.alloc_mode = None
+                state.alloc_budget = None
+                state.phase = "WAIT_MAIN"
                 return
 
             state.alloc_df = df
-            state.phase = "WAIT_ALLOC_BUDGET"
-            bot.reply_to(message, "✅ Файл result.xlsx отримано. Введіть бюджет (наприклад: 200 або 200.5).")
+            if state.alloc_mode == "budget":
+                state.phase = "WAIT_ALLOC_BUDGET"
+                bot.reply_to(message, "✅ Файл result.xlsx отримано. Введіть бюджет (наприклад: 200 або 200.5).")
+            elif state.alloc_mode == "max_yellow":
+                _alloc_df, summary, alloc_vec = compute_allocation_max_yellow(state.alloc_df)
+
+                bio = io.BytesIO()
+                write_result_like_excel_with_new_spend(bio, state.alloc_df, new_total_spend=alloc_vec)
+
+                bio.seek(0)
+                bot.send_document(
+                    chat_id,
+                    bio,
+                    visible_file_name="allocation.xlsx",
+                    caption=summary,
+                )
+
+                used_budget = float(pd.to_numeric(alloc_vec, errors="coerce").fillna(0.0).sum())
+                explanation = build_allocation_explanation(state.alloc_df, alloc_vec, used_budget, max_lines=20)
+                bot.send_message(chat_id, explanation)
+
+                state.phase = "WAIT_MAIN"
+                state.alloc_df = None
+                state.alloc_mode = None
+                state.alloc_budget = None
+            else:
+                bot.reply_to(
+                    message,
+                    "Невідомий режим розподілу. Використай /allocate, щоб почати заново.",
+                )
+                state.phase = "WAIT_MAIN"
+                state.alloc_df = None
+                state.alloc_mode = None
+                state.alloc_budget = None
         else:
             bot.reply_to(message, "⚠️ Несподівана фаза. Спробуйте ще раз із головної таблиці.")
     except ValueError as ve:
@@ -953,8 +1098,18 @@ def on_document(message: types.Message):
                 "- Для додаткових таблиць: Країна, Сума депозитів"
             ),
         )
+        if state.phase in {"WAIT_ALLOC_RESULT", "WAIT_ALLOC_BUDGET", "WAIT_ALLOC_CHOICE"}:
+            state.phase = "WAIT_MAIN"
+            state.alloc_mode = None
+            state.alloc_df = None
+            state.alloc_budget = None
     except Exception as e:
         bot.reply_to(message, f"⚠️ Непередбачена помилка: <code>{e}</code>")
+        if state.phase in {"WAIT_ALLOC_RESULT", "WAIT_ALLOC_BUDGET", "WAIT_ALLOC_CHOICE"}:
+            state.phase = "WAIT_MAIN"
+            state.alloc_mode = None
+            state.alloc_df = None
+            state.alloc_budget = None
 
 
 @bot.message_handler(commands=["allocate"])
@@ -962,13 +1117,53 @@ def on_document(message: types.Message):
 def cmd_allocate(message: types.Message):
     chat_id = message.chat.id
     state = user_states.setdefault(chat_id, UserState())
+    state.phase = "WAIT_ALLOC_CHOICE"
+    state.alloc_df = None
+    state.alloc_budget = None
+    state.alloc_mode = None
+
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(
+        types.InlineKeyboardButton("📊 За бюджетом", callback_data="alloc_mode_budget"),
+        types.InlineKeyboardButton("💛 Максимум жовтих", callback_data="alloc_mode_max_yellow"),
+    )
+
+    bot.reply_to(
+        message,
+        "Оберіть режим розподілу бюджету:",
+        reply_markup=keyboard,
+    )
+
+
+@bot.callback_query_handler(func=lambda c: c.data in {"alloc_mode_budget", "alloc_mode_max_yellow"})
+@require_access_cb
+def on_allocate_mode(call: types.CallbackQuery):
+    chat_id = call.message.chat.id
+    state = user_states.setdefault(chat_id, UserState())
+
+    if call.data == "alloc_mode_budget":
+        state.alloc_mode = "budget"
+        prompt = (
+            "Режим <b>за бюджетом</b> обрано. Надішліть файл <b>result.xlsx</b>. "
+            "Після завантаження попрошу вказати бюджет (Spend)."
+        )
+    else:
+        state.alloc_mode = "max_yellow"
+        prompt = (
+            "Режим <b>максимум жовтих</b> обрано. Надішліть файл <b>result.xlsx</b>. "
+            "Цей режим не питатиме про бюджет — одразу перерахує мінімальний spend."
+        )
+
     state.phase = "WAIT_ALLOC_RESULT"
     state.alloc_df = None
     state.alloc_budget = None
-    bot.reply_to(
-        message,
-        "Надішли, будь ласка, файл <b>result.xlsx</b> (той, що бот згенерував). Після цього попрошу ввести бюджет (Spend)."
-    )
+
+    try:
+        bot.answer_callback_query(call.id, "Режим застосовано.")
+    except Exception:
+        pass
+
+    bot.send_message(chat_id, prompt)
 
 
 @bot.message_handler(content_types=["text"], func=lambda m: not (m.text or "").startswith("/"))
@@ -994,6 +1189,8 @@ def on_text(message: types.Message):
     if state.alloc_df is None or len(state.alloc_df) == 0:
         bot.reply_to(message, "Немає завантаженої таблиці Result. Використай /allocate ще раз.")
         state.phase = "WAIT_MAIN"
+        state.alloc_mode = None
+        state.alloc_budget = None
         return
 
     # Compute allocation
@@ -1018,6 +1215,9 @@ def on_text(message: types.Message):
 
     # reset phase (or keep?)
     state.phase = "WAIT_MAIN"
+    state.alloc_mode = None
+    state.alloc_df = None
+    state.alloc_budget = None
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "skip_offer")
