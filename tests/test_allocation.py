@@ -293,6 +293,35 @@ def test_classify_status_uses_red_cutoff_from_below_and_excel_rule_matches():
     assert any(f"$H2<=$I2*{main_mod.RED_MULT:.1f}" in f for f in red_rule_formulae)
 
 
+def test_allocation_explanation_reflects_custom_targets_in_status_counts():
+    os.environ["BOT_TOKEN"] = "258:CUSTOM"
+    main_mod = importlib.reload(importlib.import_module("main"))
+
+    df = pd.DataFrame(
+        {
+            "Назва Офферу": ["Offer X"],
+            "ГЕО": ["UA"],
+            "FTD qty": [10],
+            "Total spend": [50.0],
+            "Total Dep Amount": [400.0],
+            "Total+%": [120.0],
+            "CPA Target": [5.0],
+        }
+    )
+
+    alloc_vec = pd.Series([65.0], index=df.index, dtype=float)
+
+    explanation = main_mod.build_allocation_explanation(
+        df,
+        alloc_vec,
+        budget=float(df["Total spend"].sum()),
+        alloc_is_delta=False,
+    )
+
+    assert "Жовтих ДО/ПІСЛЯ: 1 → 0" in explanation
+    assert "Yellow → Red" in explanation
+
+
 def test_read_result_allocation_table_handles_formula_total_plus_percent(tmp_path):
     os.environ["BOT_TOKEN"] = "456:FORM"
     main_mod = importlib.reload(importlib.import_module("main"))

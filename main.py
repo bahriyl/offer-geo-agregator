@@ -1301,9 +1301,16 @@ def on_document(message: types.Message):
                 K = pd.to_numeric(df_norm.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
                 F_before = total_spend
                 F_after = pd.to_numeric(alloc_vec, errors="coerce").reindex(df_norm.index).fillna(0.0)
+                targets, _ = _extract_targets(df_norm)
 
-                before_status = [_classify_status(float(E[i]), float(F_before[i]), float(K[i])) for i in df_norm.index]
-                after_status = [_classify_status(float(E[i]), float(F_after[i]), float(K[i])) for i in df_norm.index]
+                before_status = [
+                    _classify_status(float(E[i]), float(F_before[i]), float(K[i]), float(targets.at[i]))
+                    for i in df_norm.index
+                ]
+                after_status = [
+                    _classify_status(float(E[i]), float(F_after[i]), float(K[i]), float(targets.at[i]))
+                    for i in df_norm.index
+                ]
 
                 total_posE = int((E > 0).sum())
                 yellow_after = sum(1 for s in after_status if s == "Yellow")
