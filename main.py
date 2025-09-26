@@ -18,9 +18,11 @@ ADDITIONAL_REQUIRED_COLS = ["Країна", "Сума депозитів"]
 
 bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-H_THRESH = 9.0  # H <= 9 is "good"
-L_THRESH = 39.99  # L > 39.99 is "good" (strict >)
-CPA_CAP = 11.0
+CPA_TARGET_DEFAULT = 8.0
+CPA_TARGET_INT = int(CPA_TARGET_DEFAULT)
+YELLOW_MULT = 1.31
+RED_MULT = 1.8
+DEPOSIT_GREEN_MIN = 39.0
 EPS = 1e-12
 EPS_YEL = 1e-6
 
@@ -518,20 +520,124 @@ def ask_additional_table_with_skip(message: types.Message, state: UserState):
 
 # ===================== ALLOCATION HELPERS =====================
 
-def _classify_status(E: float, F: float, K: float) -> str:
+def _resolve_target_value(raw: Optional[float]) -> Tuple[float, int]:
+    value = float(raw) if raw is not None and np.isfinite(raw) and raw > 0 else CPA_TARGET_DEFAULT
+    target_int = int(np.floor(value)) if value > 0 else CPA_TARGET_INT
+    if target_int <= 0:
+        target_int = CPA_TARGET_INT
+    return value, target_int
+
+
+def _calc_cpa(e: float, f: float) -> float:
+    if e <= 0:
+        return float("inf")
+    return 1.3 * f / e
+
+
+def _calc_deposit_pct(k: float, f: float) -> float:
+    if f <= 0:
+        return float("inf")
+    return (100.0 * k) / (1.3 * f)
+
+
+def _extract_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    targets = pd.to_numeric(df.get("CPA Target", CPA_TARGET_DEFAULT), errors="coerce").fillna(CPA_TARGET_DEFAULT)
+    targets = targets.where(targets > 0, CPA_TARGET_DEFAULT)
+    target_ints = np.floor(targets.to_numpy())
+    target_ints[~np.isfinite(target_ints) | (target_ints <= 0)] = CPA_TARGET_INT
+    target_ints = target_ints.astype(int)
+    return targets, pd.Series(target_ints, index=df.index)
+
+
+def _build_threshold_table(E: pd.Series, K: pd.Series, targets: pd.Series, target_ints: pd.Series) -> pd.DataFrame:
+    e = E.to_numpy(dtype=float)
+    k = K.to_numpy(dtype=float)
+    t = targets.to_numpy(dtype=float)
+    tint = target_ints.to_numpy(dtype=float)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        green_cpa_limit = np.where(e > 0, (tint * e) / 1.3, 0.0)
+        deposit_break = np.where((k > 0) & (DEPOSIT_GREEN_MIN > 0), (100.0 * k) / (1.3 * DEPOSIT_GREEN_MIN), 0.0)
+        yellow_soft = np.where(e > 0, (t * YELLOW_MULT * e) / 1.3, 0.0)
+        red_limit = np.where(e > 0, (t * RED_MULT * e) / 1.3, 0.0)
+
+    red_ceiling = np.maximum(red_limit - EPS_YEL, 0.0)
+    yellow_soft = np.minimum(yellow_soft, red_ceiling)
+    green_ceiling = np.minimum(green_cpa_limit, np.maximum(deposit_break - EPS_YEL, 0.0))
+
+    return pd.DataFrame({
+        "target": t,
+        "target_int": target_ints.astype(int),
+        "green_cpa_limit": green_cpa_limit,
+        "deposit_break": deposit_break,
+        "green_ceiling": green_ceiling,
+        "yellow_soft_ceiling": yellow_soft,
+        "red_ceiling": red_ceiling,
+    }, index=E.index)
+
+
+def _compute_make_yellow_target(e: float, f_cur: float, k: float, thresholds_row: pd.Series) -> Optional[float]:
+    if e <= 0:
+        return None
+    red_ceiling = float(thresholds_row.get("red_ceiling", 0.0))
+    if red_ceiling <= f_cur + EPS:
+        return None
+
+    candidates: List[float] = []
+
+    cpa_cross = float(thresholds_row.get("green_cpa_limit", 0.0))
+    if np.isfinite(cpa_cross) and cpa_cross > f_cur + EPS:
+        candidates.append(min(red_ceiling, cpa_cross + EPS_YEL))
+
+    deposit_break = float(thresholds_row.get("deposit_break", 0.0))
+    if np.isfinite(deposit_break) and deposit_break > f_cur + EPS:
+        candidate_raw = deposit_break + EPS_YEL
+        if _calc_cpa(e, candidate_raw) < float(thresholds_row.get("target_int", CPA_TARGET_INT)) + EPS:
+            candidates.append(min(red_ceiling, candidate_raw))
+
+    if not candidates:
+        return None
+
+    yellow_soft = float(thresholds_row.get("yellow_soft_ceiling", 0.0))
+    if yellow_soft > 0:
+        candidates = [min(c, yellow_soft) for c in candidates]
+
+    target_value = min(candidates)
+    return target_value if target_value > f_cur + EPS else None
+
+
+def _compute_yellow_limit(e: float, f_cur: float, k: float, thresholds_row: pd.Series) -> float:
+    red_ceiling = float(thresholds_row.get("red_ceiling", 0.0))
+    if red_ceiling <= 0:
+        return 0.0
+    deposit_now = _calc_deposit_pct(k, f_cur)
+    if deposit_now > DEPOSIT_GREEN_MIN + EPS:
+        limit = float(thresholds_row.get("yellow_soft_ceiling", 0.0))
+    else:
+        limit = max(0.0, float(thresholds_row.get("green_cpa_limit", 0.0)) - EPS_YEL)
+    return min(max(limit, 0.0), red_ceiling)
+
+
+def _classify_status(E: float, F: float, K: float, target: Optional[float] = None) -> str:
     if E <= 0:
         return "Grey"
-    H = 1.3 * F / E if E else float("inf")
-    L = (100.0 * K) / (1.3 * F) if F else float("inf")
+    target_val, target_int = _resolve_target_value(target)
+    cpa = _calc_cpa(E, F)
+    deposit_pct = _calc_deposit_pct(K, F)
 
-    # Green: E>0 and H<=9 and L>39.99
-    green = (H <= H_THRESH + EPS) and (L > L_THRESH + EPS)
-    if green:
+    if (cpa <= target_int + EPS) and (deposit_pct > DEPOSIT_GREEN_MIN + EPS):
         return "Green"
 
-    # Yellow: E>0 and ((H<=9) or (L>39.99)) and not Green
-    yellow = (H <= H_THRESH + EPS) or (L > L_THRESH + EPS)
-    return "Yellow" if yellow else "Red"  # Red: H>9 and L<=39.99
+    if cpa > target_val * RED_MULT + EPS:
+        return "Red"
+
+    if (deposit_pct > DEPOSIT_GREEN_MIN + EPS) and (cpa >= target_int - EPS) and (cpa < target_val * YELLOW_MULT - EPS):
+        return "Yellow"
+
+    if (deposit_pct <= DEPOSIT_GREEN_MIN + EPS) and (cpa < target_int - EPS):
+        return "Yellow"
+
+    return "Yellow"
 
 
 def _fmt(v: float, suf: str = "", nan_text: str = "-") -> str:
@@ -564,13 +670,20 @@ def build_allocation_explanation(df_source: pd.DataFrame,
     E = pd.to_numeric(df.get("FTD qty", 0), errors="coerce").fillna(0.0)
     F = pd.to_numeric(df.get("Total spend", 0), errors="coerce").fillna(0.0)
     K = pd.to_numeric(df.get("Total Dep Amount", 0), errors="coerce").fillna(0.0)
+    targets, _ = _extract_targets(df)
 
     alloc = pd.to_numeric(alloc_vec, errors="coerce").reindex(df.index).fillna(0.0)
     F_new = (F + alloc)
 
     # Статуси ДО/ПІСЛЯ
-    before = [_classify_status(float(E[i]), float(F[i]), float(K[i])) for i in df.index]
-    after = [_classify_status(float(E[i]), float(F_new[i]), float(K[i])) for i in df.index]
+    before = [
+        _classify_status(float(E[i]), float(F[i]), float(K[i]), float(targets.at[i]))
+        for i in df.index
+    ]
+    after = [
+        _classify_status(float(E[i]), float(F_new[i]), float(K[i]), float(targets.at[i]))
+        for i in df.index
+    ]
 
     # Метрики
     total_budget = float(budget)
@@ -615,7 +728,9 @@ def build_allocation_explanation(df_source: pd.DataFrame,
 
     header = (
         f"Розподіл бюджету: {used:.2f} / {total_budget:.2f} використано; залишок {left:.2f}\n"
-        f"Жовтих ДО/ПІСЛЯ: {yellow_before} → {yellow_after} (зел.→жовт.: {green_to_yellow})"
+        f"Жовтих ДО/ПІСЛЯ: {yellow_before} → {yellow_after} (зел.→жовт.: {green_to_yellow})\n"
+        f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — або депозит>{DEPOSIT_GREEN_MIN:.0f}% із CPA в діапазоні [INT(target); target×{YELLOW_MULT:.2f}),"
+        f" або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target); red — CPA>target×{RED_MULT:.1f}."
     )
 
     if not detail_lines:
@@ -631,7 +746,7 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
       - кожен рядок має цільовий spend у колонці "Total+%" (верхня межа);
       - доступний глобальний бюджет = сума позитивних (Target - Total spend);
       - розподіл іде за зростанням Target: спершу переводимо green у yellow,
-        потім (якщо лишилися кошти) наближаємо yellow до межі red, не перетинаючи її.
+        потім (якщо лишилися кошти) насичуємо жовті в межах CPA < target×YELLOW_MULT і нижче межі target×RED_MULT.
     Повертає оновлену таблицю, фактично розподілений бюджет та серію дельт по рядках.
     """
 
@@ -642,14 +757,15 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     F = pd.to_numeric(dfw.get("Total spend", 0.0), errors="coerce").fillna(0.0)
     K = pd.to_numeric(dfw.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
     T = pd.to_numeric(dfw.get("Total+%", 0.0), errors="coerce").fillna(0.0)
+    targets, target_ints = _extract_targets(dfw)
+    thresholds = _build_threshold_table(E, K, targets, target_ints)
 
-    # Глобальна верхня межа (з урахуванням CPA cap)
-    F_cap = pd.Series(np.where(E > 0, CPA_CAP * E / 1.3, 0.0), index=dfw.index)
-    cap_headroom = (F_cap - F).clip(lower=0.0)
+    stop_before_red = thresholds["red_ceiling"].fillna(0.0)
     target_delta = (T - F).clip(lower=0.0)
-    cap_for_min = cap_headroom.where(np.isfinite(cap_headroom), target_delta)
+    red_headroom = (stop_before_red - F).clip(lower=0.0)
+
     row_allowance = pd.Series(
-        np.minimum(target_delta.to_numpy(), cap_for_min.to_numpy()),
+        np.minimum(target_delta.to_numpy(), red_headroom.to_numpy()),
         index=dfw.index,
     )
     row_allowance = pd.to_numeric(row_allowance, errors="coerce").fillna(0.0)
@@ -660,32 +776,6 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     alloc = pd.Series(0.0, index=dfw.index, dtype=float)
     F_now = F.copy()
     rem = available_budget
-
-    F_at_H = pd.Series(np.where(E > 0, H_THRESH * E / 1.3, 0.0), index=dfw.index)
-    F_at_L = pd.Series(np.where(E > 0, (100.0 * K) / (1.3 * L_THRESH), 0.0), index=dfw.index)
-
-    def _min_yellow_target(e: float, f_cur: float, k: float) -> Optional[float]:
-        if e <= 0:
-            return None
-        H_cur = 1.3 * f_cur / e if e > 0 else float("inf")
-        L_cur = (100.0 * k) / (1.3 * f_cur) if f_cur > 0 else float("inf")
-        if (H_cur > H_THRESH + EPS) or (L_cur <= L_THRESH + EPS):
-            return None  # вже не green
-
-        Fh = (H_THRESH * e / 1.3) + EPS_YEL
-        Fl = ((100.0 * k) / (1.3 * L_THRESH)) + EPS_YEL
-        candidates = []
-        for Ft in (Fh, Fl):
-            if not np.isfinite(Ft) or Ft <= f_cur + EPS:
-                continue
-            Ht = 1.3 * Ft / e if e > 0 else float("inf")
-            Lt = (100.0 * k) / (1.3 * Ft) if Ft > 0 else float("inf")
-            is_red = (Ht > H_THRESH + EPS) and (Lt <= L_THRESH + EPS)
-            if not is_red:
-                candidates.append(Ft)
-        if not candidates:
-            return None
-        return min(candidates)
 
     # Крок 1: переводимо green у yellow
     for idx in order:
@@ -699,12 +789,14 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
             continue
         ki = float(K.at[idx])
         f_cur = float(F_now.at[idx])
-        target_yellow = _min_yellow_target(ei, f_cur, ki)
+        status_now = _classify_status(ei, f_cur, ki, float(targets.at[idx]))
+        if status_now != "Green":
+            continue
+        target_yellow = _compute_make_yellow_target(ei, f_cur, ki, thresholds.loc[idx])
         if target_yellow is None:
             continue
-        max_target = float(F.at[idx] + row_allowance.at[idx])
-        f_goal = min(target_yellow, max_target)
-        need = f_goal - f_cur
+        max_target = min(target_yellow, float(F.at[idx] + row_allowance.at[idx]))
+        need = max_target - f_cur
         if need <= 1e-9:
             continue
         give = min(rem, need, allowance_left)
@@ -714,49 +806,49 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
         F_now.at[idx] += give
         rem -= give
 
-    # Крок 2: насичуємо yellow до межі red (залишаючись у yellow)
+    # Крок 2: насичуємо yellow в межах нових правил
     if rem > 1e-9:
-        F_yellow_limit = pd.Series(np.maximum(F_at_H, F_at_L - EPS_YEL), index=dfw.index)
-        for idx in order:
+        F_mid = F + alloc
+        status_mid = pd.Series([
+            _classify_status(float(E.at[i]), float(F_mid.at[i]), float(K.at[i]), float(targets.at[i]))
+            for i in dfw.index
+        ], index=dfw.index)
+        is_yellow_mid = status_mid == "Yellow"
+
+        yellow_limit = pd.Series(0.0, index=dfw.index, dtype=float)
+        for idx in dfw.index:
+            if not is_yellow_mid.at[idx]:
+                continue
+            limit_val = _compute_yellow_limit(float(E.at[idx]), float(F_mid.at[idx]), float(K.at[idx]), thresholds.loc[idx])
+            limit_val = min(limit_val, float(F.at[idx] + row_allowance.at[idx]))
+            yellow_limit.at[idx] = max(limit_val, float(F_mid.at[idx]))
+
+        headroom = (yellow_limit - F_mid).clip(lower=0.0)
+
+        for idx in headroom.sort_values(ascending=False).index:
             if rem <= 1e-9:
                 break
             allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
             if allowance_left <= 1e-9:
                 continue
-            ei = float(E.at[idx])
-            if ei <= 0:
+            head = float(headroom.at[idx])
+            if head <= 1e-9:
                 continue
-            ki = float(K.at[idx])
-            f_cur = float(F_now.at[idx])
-            status_now = _classify_status(ei, f_cur, ki)
-            if status_now != "Yellow":
-                continue
-            max_target = min(
-                float(F.at[idx] + row_allowance.at[idx]),
-                float(F_cap.at[idx]) if np.isfinite(F_cap.at[idx]) else float("inf"),
-                float(F_yellow_limit.at[idx])
-            )
-            headroom = max_target - f_cur
-            if headroom <= 1e-9:
-                continue
-            give = min(rem, headroom, allowance_left)
+            give = min(rem, head, allowance_left)
             if give <= 1e-9:
                 continue
             alloc.at[idx] += give
-            F_now.at[idx] += give
             rem -= give
 
     F_final = F + alloc
-    with np.errstate(divide='ignore', invalid='ignore'):
-        H_final = 1.3 * F_final / E.replace(0, np.nan)
-        L_final = 100.0 * K / (1.3 * F_final.replace(0, np.nan))
-
-    still_green = (E > 0) & (H_final <= H_THRESH + EPS) & (L_final > L_THRESH + EPS)
-    still_yellow = (E > 0) & (((H_final <= H_THRESH + EPS) | (L_final > L_THRESH + EPS)) & (~still_green))
+    statuses_final = pd.Series([
+        _classify_status(float(E.at[i]), float(F_final.at[i]), float(K.at[i]), float(targets.at[i]))
+        for i in dfw.index
+    ], index=dfw.index)
 
     dfw["Allocated extra"] = alloc
     dfw["New Total spend"] = F_final
-    dfw["Will be yellow"] = ["Yes" if x else "No" for x in still_yellow]
+    dfw["Will be yellow"] = ["Yes" if statuses_final.at[i] == "Yellow" else "No" for i in dfw.index]
 
     used = float(alloc.sum())
 
@@ -765,19 +857,14 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
 
 def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.DataFrame, str, pd.Series]:
     """
-    Нова послідовність:
-      A) Спочатку намагаємось мінімально перевести GREEN -> YELLOW (дотримуючись CPA<=CPA_CAP).
-      B) Якщо залишився бюджет — насичуємо YELLOW максимально, але так, щоб вони залишались YELLOW (і CPA<=CPA_CAP).
+    Алгоритм нового розподілу:
+      A) Мінімально переводимо GREEN → YELLOW (рухаємо CPA до INT(target) або депозит до 39%, не перетинаючи червону межу).
+      B) Якщо залишився бюджет — насичуємо жовті, але тримаємося в межах CPA < target×YELLOW_MULT та нижче червоної межі target×RED_MULT.
 
     Позначення:
-      E = FTD qty
-      F = Total spend
-      K = Total Dep Amount
-
-    Межі/похідні:
-      F_at_H = H_THRESH * E / 1.3
-      F_at_L = (100 * K) / (1.3 * L_THRESH)  # L == L_THRESH при такому F
-      F_cap  = CPA_CAP * E / 1.3
+      E = FTD qty,
+      F = Total spend,
+      K = Total Dep Amount.
     """
     dfw = df.copy()
 
@@ -785,22 +872,15 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
     E = pd.to_numeric(dfw["FTD qty"], errors="coerce").fillna(0.0)
     F = pd.to_numeric(dfw["Total spend"], errors="coerce").fillna(0.0)
     K = pd.to_numeric(dfw["Total Dep Amount"], errors="coerce").fillna(0.0)
+    targets, target_ints = _extract_targets(dfw)
+    thresholds = _build_threshold_table(E, K, targets, target_ints)
 
-    # Поточні H, L
-    with np.errstate(divide='ignore', invalid='ignore'):
-        H = 1.3 * F / E.replace(0, np.nan)
-        L = 100.0 * K / (1.3 * F.replace(0, np.nan))
+    statuses_now = pd.Series([
+        _classify_status(float(E.at[i]), float(F.at[i]), float(K.at[i]), float(targets.at[i]))
+        for i in dfw.index
+    ], index=dfw.index)
 
-    # Межі
-    F_at_H = H_THRESH * E / 1.3
-    F_at_L = (100.0 * K) / (1.3 * L_THRESH)
-    F_cap = CPA_CAP * E / 1.3
-
-    # Маски статусів (строго відповідно до правил/Excel)
-    grey_mask = (E <= 0)
-    green_mask = (~grey_mask) & (H <= H_THRESH + EPS) & (L > L_THRESH + EPS)
-    yellow_mask = (~grey_mask) & ((H <= H_THRESH + EPS) | (L > L_THRESH + EPS)) & (~green_mask)
-    # red_mask   = (~grey_mask) & (~green_mask) & (~yellow_mask)  # не потрібен явно
+    green_mask = statuses_now == "Green"
 
     alloc = pd.Series(0.0, index=dfw.index, dtype=float)
     rem = float(budget) if budget and budget > 0 else 0.0
@@ -808,114 +888,78 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
     # -------------------------------
     # A) GREEN -> YELLOW (мінімальний spend)
     # -------------------------------
-    # Кандидати цільових F:
-    #   - перетнути межу H: F_cross_H = F_at_H + EPS_YEL (робить H трохи > H_THRESH)
-    #   - перетнути межу L: F_cross_L = F_at_L + EPS_YEL (робить L трохи < L_THRESH)
-    F_cross_H = F_at_H + EPS_YEL
-    F_cross_L = F_at_L + EPS_YEL
+    make_yellow_targets = pd.Series(np.nan, index=dfw.index)
+    for idx in dfw.index:
+        if not green_mask.at[idx]:
+            continue
+        goal = _compute_make_yellow_target(float(E.at[idx]), float(F.at[idx]), float(K.at[idx]), thresholds.loc[idx])
+        if goal is not None:
+            make_yellow_targets.at[idx] = goal
 
-    # Мінімальний F, який зламав "зеленість", але не робить рядок "червоним" і не перевищує CPA cap.
-    candidates = pd.DataFrame({
-        "F_now": F,
-        "F_cap": F_cap,
-        "F_cross_H": F_cross_H,
-        "F_cross_L": F_cross_L,
-        "E": E,
-        "K": K
-    })
+    need_delta = (make_yellow_targets - F).clip(lower=0.0)
 
-    # Для кожного green обчислюємо найменшу допустиму ціль F_target
-    F_target = F.copy()
-
-    for i in candidates[green_mask].index:
-        Fi = float(candidates.at[i, "F_now"])
-        Fcap = float(candidates.at[i, "F_cap"])
-        Fh = float(candidates.at[i, "F_cross_H"])
-        Fl = float(candidates.at[i, "F_cross_L"])
-        Ei = float(E.at[i])
-        Ki = float(K.at[i])
-
-        # Обидва потенційні цілі в межах CPA?
-        options = []
-        for Ft in (Fh, Fl):
-            if np.isfinite(Ft) and Ft > Fi + EPS and Ft <= Fcap + EPS:
-                # Перевіримо, що Ft не робить рядок "червоним"
-                Ht = 1.3 * Ft / Ei if Ei > 0 else float("inf")
-                Lt = (100.0 * Ki) / (1.3 * Ft) if Ft > 0 else float("inf")
-                is_red = (Ht > H_THRESH + EPS) and (Lt <= L_THRESH + EPS)
-                if not is_red:
-                    options.append(Ft)
-
-        if options:
-            F_target.at[i] = min(options)  # найменша ціна переходу
-        else:
-            # неможливо легально зробити жовтим — залишаємо як є
-            F_target.at[i] = Fi
-
-    need_delta = (F_target - F).clip(lower=0.0)
-
-    # Розподіл: за зростанням потрібної дельти
-    for i in need_delta[green_mask].sort_values(ascending=True).index:
+    for idx in need_delta[green_mask].sort_values(ascending=True).index:
         if rem <= 1e-9:
             break
-        need = float(need_delta.at[i])
+        need = float(need_delta.at[idx])
         if need <= 0:
             continue
         take = min(rem, need)
-        alloc.at[i] += take
+        if take <= 0:
+            continue
+        alloc.at[idx] += take
         rem -= take
 
     # -------------------------------
-    # B) Насичення YELLOW, щоб лишались YELLOW (CPA<=cap)
+    # B) Насичення YELLOW в межах правил (залишитись жовтими)
     # -------------------------------
     if rem > 1e-9:
-        # Перерахувати F після кроку A
         F_mid = F + alloc
-        with np.errstate(divide='ignore', invalid='ignore'):
-            H_mid = 1.3 * F_mid / E.replace(0, np.nan)
-            L_mid = 100.0 * K / (1.3 * F_mid.replace(0, np.nan))
+        status_mid = pd.Series([
+            _classify_status(float(E.at[i]), float(F_mid.at[i]), float(K.at[i]), float(targets.at[i]))
+            for i in dfw.index
+        ], index=dfw.index)
 
-        # Ті, хто зараз жовті (включно з новими з кроку A)
-        is_green_mid = (~(E <= 0)) & (H_mid <= H_THRESH + EPS) & (L_mid > L_THRESH + EPS)
-        is_yellow_mid = (~(E <= 0)) & (((H_mid <= H_THRESH + EPS) | (L_mid > L_THRESH + EPS)) & (~is_green_mid))
+        yellow_limit = pd.Series(0.0, index=dfw.index, dtype=float)
+        for idx in dfw.index:
+            if status_mid.at[idx] != "Yellow":
+                continue
+            limit_val = _compute_yellow_limit(float(E.at[idx]), float(F_mid.at[idx]), float(K.at[idx]), thresholds.loc[idx])
+            yellow_limit.at[idx] = max(limit_val, float(F_mid.at[idx]))
 
-        # Межа "залишитись жовтим": до max(F_at_H, F_at_L - EPS_YEL), та ще й не перевищити cap
-        F_yellow_limit_base = pd.Series(np.maximum(F_at_H, F_at_L - EPS_YEL), index=dfw.index)
-        F_yellow_limit_final = pd.Series(np.minimum(F_yellow_limit_base, F_cap), index=dfw.index).fillna(0.0)
+        headroom = (yellow_limit - F_mid).clip(lower=0.0)
 
-        headroom = (F_yellow_limit_final - F_mid).clip(lower=0.0)
-
-        # Greedy за спаданням headroom
-        for i in headroom[is_yellow_mid].sort_values(ascending=False).index:
+        for idx in headroom.sort_values(ascending=False).index:
             if rem <= 1e-9:
                 break
-            give = float(min(rem, headroom.at[i]))
-            if give <= 0:
+            head = float(headroom.at[idx])
+            if head <= 1e-9:
                 continue
-            alloc.at[i] += give
+            give = min(rem, head)
+            if give <= 1e-9:
+                continue
+            alloc.at[idx] += give
             rem -= give
 
     # ПІДСУМОК
     F_final = F + alloc
-    with np.errstate(divide='ignore', invalid='ignore'):
-        H_final = 1.3 * F_final / E.replace(0, np.nan)
-        L_final = 100.0 * K / (1.3 * F_final.replace(0, np.nan))
+    statuses_final = pd.Series([
+        _classify_status(float(E.at[i]), float(F_final.at[i]), float(K.at[i]), float(targets.at[i]))
+        for i in dfw.index
+    ], index=dfw.index)
 
-    still_green = (E > 0) & (H_final <= H_THRESH + EPS) & (L_final > L_THRESH + EPS)
-    still_yellow = (E > 0) & (((H_final <= H_THRESH + EPS) | (L_final > L_THRESH + EPS)) & (~still_green))
-
-    kept_yellow = int(still_yellow.sum())
+    kept_yellow = int((statuses_final == "Yellow").sum())
     total_posE = int((E > 0).sum())
 
     dfw["Allocated extra"] = alloc
     dfw["New Total spend"] = F_final
-    dfw["Will be yellow"] = ["Yes" if x else "No" for x in still_yellow]
+    dfw["Will be yellow"] = ["Yes" if statuses_final.at[i] == "Yellow" else "No" for i in dfw.index]
 
     summary = (
         f"Бюджет: {budget:.2f}\n"
         f"Жовтих після розподілу: {kept_yellow}/{total_posE}\n"
-        f"Правила: спочатку переводимо зелені в жовті мінімальним spend (CPA≤{CPA_CAP:g}), "
-        f"потім насичуємо жовті в межах жовтого (H≤{H_THRESH:g} або L>{L_THRESH:.2f}, CPA≤{CPA_CAP:g})."
+        f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — тримаємо CPA нижче target×{YELLOW_MULT:.2f} "
+        f"(або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target)), red — CPA>target×{RED_MULT:.1f}."
     )
     return dfw, summary, alloc
 
@@ -979,7 +1023,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO, df_source: pd.DataFr
         for r in range(first_row, last_row + 1):
             ws[f"G{r}"].value = f"=F{r}*1.3"  # Total+%
             ws[f"H{r}"].value = f"=IFERROR(G{r}/E{r},\"\")"  # CPA
-            ws[f"I{r}"].value = 8  # CPA Target
+            ws[f"I{r}"].value = CPA_TARGET_DEFAULT  # CPA Target
             ws[f"J{r}"].value = f"=IFERROR(K{r}/E{r},\"\")"  # СP/Ч
             ws[f"L{r}"].value = f"=IFERROR(K{r}/G{r}*100,0)"  # My deposit amount
             ws[f"M{r}"].value = f"=G{r}*0.4"  # Profit 40%
@@ -1004,7 +1048,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO, df_source: pd.DataFr
             for r in range(first_row, last_row + 1):
                 ws[f"{col}{r}"].number_format = "0.00"
 
-        # Conditional formatting — SAME rules/colors
+        # Conditional formatting за новими правилами
         data_range = f"A{first_row}:P{last_row}"
         grey = PatternFill("solid", fgColor="BFBFBF")
         green = PatternFill("solid", fgColor="C6EFCE")
@@ -1013,11 +1057,18 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO, df_source: pd.DataFr
 
         ws.conditional_formatting.add(data_range, FormulaRule(formula=["$E2=0"], fill=grey, stopIfTrue=True))
         ws.conditional_formatting.add(data_range,
-                                      FormulaRule(formula=["AND($E2>0,$H2<=9,$L2>39.99)"], fill=green, stopIfTrue=True))
-        ws.conditional_formatting.add(data_range, FormulaRule(formula=["AND($E2>0,OR($H2<=9,$L2>39.99))"], fill=yellow,
+                                      FormulaRule(formula=[f"AND($E2>0,$H2<=INT($I2),$L2>{DEPOSIT_GREEN_MIN:.0f})"], fill=green, stopIfTrue=True))
+        yellow_formula = (
+            "AND($E2>0,OR("
+            f"AND($L2>{DEPOSIT_GREEN_MIN:.0f},$H2>=INT($I2),$H2<$I2*{YELLOW_MULT:.2f}),"
+            f"AND($L2<={DEPOSIT_GREEN_MIN:.0f},$H2<INT($I2)),"
+            f"AND($H2<=$I2*{RED_MULT:.1f})"
+            "))"
+        )
+        ws.conditional_formatting.add(data_range, FormulaRule(formula=[yellow_formula], fill=yellow,
                                                               stopIfTrue=True))
         ws.conditional_formatting.add(data_range,
-                                      FormulaRule(formula=["AND($E2>0,$H2>9,$L2<39.99)"], fill=red, stopIfTrue=True))
+                                      FormulaRule(formula=[f"AND($E2>0,$H2>$I2*{RED_MULT:.1f})"], fill=red, stopIfTrue=True))
 
 
 # ===================== BOT HANDLERS =====================
@@ -1607,7 +1658,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         for r in range(first_row, last_row + 1):
             ws[f"G{r}"].value = f"=F{r}*1.3"  # Total+%
             ws[f"H{r}"].value = f"=IFERROR(G{r}/E{r},\"\")"  # CPA
-            ws[f"I{r}"].value = 8  # CPA Target
+            ws[f"I{r}"].value = CPA_TARGET_DEFAULT  # CPA Target
             ws[f"J{r}"].value = f"=IFERROR(K{r}/E{r},\"\")"  # СP/Ч
             ws[f"L{r}"].value = f"=IFERROR(K{r}/G{r}*100,0)"  # My deposit amount
             ws[f"M{r}"].value = f"=G{r}*0.4"  # Profit 40%
@@ -1618,7 +1669,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         for r in range(first_row, last_row + 1):
             ws[f"E{r}"].number_format = "0"
 
-        # Two decimals: F..N except I (integer target), but leave I as integer 8
+        # Two decimals: F..N except I (integer target column)
         two_dec_cols = ["F", "G", "H", "J", "K", "L", "M", "N"]
         for col in two_dec_cols:
             for r in range(first_row, last_row + 1):
@@ -1640,7 +1691,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         for col, w in widths.items():
             ws.column_dimensions[col].width = w
 
-        # Conditional formatting (unchanged logic, new letters)
+        # Conditional formatting за новими правилами
         data_range = f"A{first_row}:P{last_row}"
         grey = PatternFill("solid", fgColor="BFBFBF")
         green = PatternFill("solid", fgColor="C6EFCE")
@@ -1653,15 +1704,22 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         )
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=["AND($E2>0,$H2<=9,$L2>39.99)"], fill=green, stopIfTrue=True),
+            FormulaRule(formula=[f"AND($E2>0,$H2<=INT($I2),$L2>{DEPOSIT_GREEN_MIN:.0f})"], fill=green, stopIfTrue=True),
+        )
+        yellow_formula = (
+            "AND($E2>0,OR("
+            f"AND($L2>{DEPOSIT_GREEN_MIN:.0f},$H2>=INT($I2),$H2<$I2*{YELLOW_MULT:.2f}),"
+            f"AND($L2<={DEPOSIT_GREEN_MIN:.0f},$H2<INT($I2)),"
+            f"AND($H2<=$I2*{RED_MULT:.1f})"
+            "))"
         )
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=["AND($E2>0,OR($H2<=9,$L2>39.99))"], fill=yellow, stopIfTrue=True),
+            FormulaRule(formula=[yellow_formula], fill=yellow, stopIfTrue=True),
         )
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=["AND($E2>0,$H2>9,$L2<39.99)"], fill=red, stopIfTrue=True),
+            FormulaRule(formula=[f"AND($E2>0,$H2>$I2*{RED_MULT:.1f})"], fill=red, stopIfTrue=True),
         )
 
     bio.seek(0)
