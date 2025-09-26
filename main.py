@@ -534,7 +534,42 @@ def read_result_allocation_table(file_bytes: bytes, filename: str) -> pd.DataFra
         series = df.get(col, pd.Series(0.0, index=df.index))
         df[col] = _normalize_money(series).fillna(0.0).round(2)
 
-    df["Total+%"] = pd.to_numeric(df.get("Total+%", 0.0), errors="coerce").fillna(0.0)
+    total_plus_raw = df.get("Total+%", pd.Series(0.0, index=df.index))
+    if not isinstance(total_plus_raw, pd.Series):
+        total_plus_raw = pd.Series(total_plus_raw, index=df.index)
+
+    total_plus_numeric = _normalize_money(total_plus_raw).astype(float)
+
+    total_spend_series = df["Total spend"].astype(float)
+    total_plus_str = total_plus_raw.astype("string")
+    formula_mask = (
+        total_plus_str.str.contains(r"=", regex=False, na=False)
+        | total_plus_str.str.contains(r"[A-Za-z]", regex=True, na=False)
+    )
+
+    valid_ratio_mask = (
+        ~formula_mask
+        & np.isfinite(total_spend_series)
+        & (total_spend_series > 0)
+        & np.isfinite(total_plus_numeric)
+        & (total_plus_numeric > 0)
+    )
+
+    if valid_ratio_mask.any():
+        multiplier = float((total_plus_numeric[valid_ratio_mask] / total_spend_series[valid_ratio_mask]).median())
+    else:
+        multiplier = 1.3
+
+    needs_recompute = (
+        formula_mask
+        | ~np.isfinite(total_plus_numeric)
+        | (total_plus_numeric <= 0)
+    )
+    fallback_mask = needs_recompute & np.isfinite(total_spend_series) & (total_spend_series > 0)
+    if fallback_mask.any():
+        total_plus_numeric.loc[fallback_mask] = total_spend_series.loc[fallback_mask] * multiplier
+
+    df["Total+%"] = total_plus_numeric.fillna(0.0)
 
     return df
 
