@@ -676,7 +676,7 @@ def _build_threshold_table(E: pd.Series, K: pd.Series, targets: pd.Series, targe
         green_cpa_limit = np.where(e > 0, (tint * e) / 1.3, 0.0)
         deposit_break = np.where((k > 0) & (DEPOSIT_GREEN_MIN > 0), (100.0 * k) / (1.3 * DEPOSIT_GREEN_MIN), 0.0)
         yellow_soft = np.where(e > 0, (t * YELLOW_MULT * e) / 1.3, 0.0)
-        red_limit = np.where(e > 0, (t * RED_MULT * e) / 1.8, 0.0)
+        red_limit = np.where(e > 0, (t * RED_MULT * e) / 1.3, 0.0)
 
     red_ceiling = np.maximum(red_limit - EPS_YEL, 0.0)
     yellow_soft = np.minimum(yellow_soft, red_ceiling)
