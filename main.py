@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import pandas as pd
 from telebot import TeleBot, types
 import numpy as np
+from datetime import datetime
 
 load_dotenv()
 
@@ -21,7 +22,7 @@ bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 CPA_TARGET_DEFAULT = 8.0
 CPA_TARGET_INT = int(CPA_TARGET_DEFAULT)
-YELLOW_MULT = 1.31
+YELLOW_MULT = 1.3
 RED_MULT = 1.8
 DEPOSIT_GREEN_MIN = 39.0
 EPS = 1e-12
@@ -38,12 +39,12 @@ def _build_yellow_formula(row: int = 2) -> str:
 
     row_ref = str(row)
     return (
-        f"AND($E{row_ref}>0,OR("
-        f"AND($L{row_ref}>{DEPOSIT_GREEN_MIN:.0f},$H{row_ref}>=INT($I{row_ref}),"
-        f"$H{row_ref}<$I{row_ref}*{YELLOW_MULT:.2f},$H{row_ref}<$I{row_ref}*{RED_MULT:.1f}),"
-        f"AND($L{row_ref}<={DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<INT($I{row_ref}),"
-        f"$H{row_ref}<$I{row_ref}*{RED_MULT:.1f})"
-        "))"
+        f"AND($E{row_ref}>0,"
+        f"OR("
+        f"AND($L{row_ref}>{DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<$I{row_ref}*{1.31:.2f}),"
+        f"AND($L{row_ref}<={DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<=INT($I{row_ref})+1)"
+        f")"
+        f")"
     )
 
 
@@ -336,11 +337,20 @@ def read_excel_robust(file_bytes: bytes, sheet_name: str, header: int = 0) -> pd
     # Helper: filter to current month
     def filter_current_month(df: pd.DataFrame) -> pd.DataFrame:
         from datetime import datetime
-        if "Дата" in df.columns:
-            df["Дата"] = pd.to_datetime(df["Дата"], format="%d/%m/%Y", errors="coerce")
-            now = datetime.now()
-            df = df[(df["Дата"].dt.month == now.month) & (df["Дата"].dt.year == now.year)]
-        return df
+        try:
+            from zoneinfo import ZoneInfo
+            now_month = datetime.now(ZoneInfo("Europe/Kyiv")).month
+        except Exception:
+            # якщо zoneinfo недоступний
+            now_month = datetime.now().month
+
+        if "Місяць" not in df.columns:
+            return df.iloc[0:0]  # або підніміть помилку, якщо так зручніше
+
+        out = df.copy()
+        # у стовпці можуть бути "", текст тощо — приводимо до числа
+        out["Місяць"] = pd.to_numeric(out["Місяць"], errors="coerce")
+        return out[out["Місяць"] == now_month]
 
     # Strategy 1: Try openpyxl with data_only=True
     try:
@@ -396,7 +406,7 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.Da
             df = read_excel_robust(file_bytes, sheet_name="BUDG", header=1)
         except Exception as e1:
             errors.append(f"header=1: {e1}")
-            # (your existing Excel fallback logic remains unchanged)
+            # (тут залишається твоя fallback-логіка для Excel)
     else:
         # CSV support
         bio = io.BytesIO(file_bytes)
@@ -410,13 +420,13 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.Da
                 bio.seek(0)
                 df_raw = pd.read_csv(bio, header=None, encoding="utf-8")
 
-        # detect header row (similar to Excel logic)
+        # detect header row
         header_row = -1
         for i in range(min(10, len(df_raw))):
             row_values = [str(v).lower().strip() for v in df_raw.iloc[i].values]
             if any("назва" in val and "оффер" in val for val in row_values) and \
-                    any("гео" in val for val in row_values) and \
-                    any("витрат" in val for val in row_values):
+               any("гео" in val for val in row_values) and \
+               any("витрат" in val for val in row_values):
                 header_row = i
                 break
 
@@ -444,8 +454,22 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.Da
             f"Перевір назви колонок у файлі."
         )
 
-    df = df[[colmap["Назва Офферу"], colmap["ГЕО"], colmap["Загальні витрати"]]].copy()
-    df.columns = ["Назва Офферу", "ГЕО", "Загальні витрати"]
+    df = df[[colmap["Назва Офферу"], colmap["ГЕО"], colmap["Загальні витрати"], *([c for c in df.columns if c == "Місяць"])]].copy()
+
+    # rename тільки основні колонки
+    rename_map = {
+        colmap["Назва Офферу"]: "Назва Офферу",
+        colmap["ГЕО"]: "ГЕО",
+        colmap["Загальні витрати"]: "Загальні витрати"
+    }
+    df.rename(columns=rename_map, inplace=True)
+
+    # --- фільтрація по поточному місяцю ---
+    if "Місяць" in df.columns:
+        from datetime import datetime
+        current_month = datetime.now().month
+        df["Місяць"] = pd.to_numeric(df["Місяць"], errors="coerce")
+        df = df[df["Місяць"] == current_month]
 
     return df
 
@@ -652,7 +676,7 @@ def _build_threshold_table(E: pd.Series, K: pd.Series, targets: pd.Series, targe
         green_cpa_limit = np.where(e > 0, (tint * e) / 1.3, 0.0)
         deposit_break = np.where((k > 0) & (DEPOSIT_GREEN_MIN > 0), (100.0 * k) / (1.3 * DEPOSIT_GREEN_MIN), 0.0)
         yellow_soft = np.where(e > 0, (t * YELLOW_MULT * e) / 1.3, 0.0)
-        red_limit = np.where(e > 0, (t * RED_MULT * e) / 1.3, 0.0)
+        red_limit = np.where(e > 0, (t * RED_MULT * e) / 1.8, 0.0)
 
     red_ceiling = np.maximum(red_limit - EPS_YEL, 0.0)
     yellow_soft = np.minimum(yellow_soft, red_ceiling)
@@ -1206,7 +1230,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
         ws.conditional_formatting.add(data_range, FormulaRule(formula=[yellow_formula], fill=yellow,
                                                               stopIfTrue=True))
         ws.conditional_formatting.add(data_range,
-                                      FormulaRule(formula=[f"AND($E2>0,$H2<=$I2*{RED_MULT:.1f})"], fill=red, stopIfTrue=True))
+                                      FormulaRule(formula=[f"AND($E2>0,$H2<$I2*{1.81:.1f})"], fill=red, stopIfTrue=True))
 
 
 # ===================== BOT HANDLERS =====================
@@ -1301,16 +1325,9 @@ def on_document(message: types.Message):
                 K = pd.to_numeric(df_norm.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
                 F_before = total_spend
                 F_after = pd.to_numeric(alloc_vec, errors="coerce").reindex(df_norm.index).fillna(0.0)
-                targets, _ = _extract_targets(df_norm)
 
-                before_status = [
-                    _classify_status(float(E[i]), float(F_before[i]), float(K[i]), float(targets.at[i]))
-                    for i in df_norm.index
-                ]
-                after_status = [
-                    _classify_status(float(E[i]), float(F_after[i]), float(K[i]), float(targets.at[i]))
-                    for i in df_norm.index
-                ]
+                before_status = [_classify_status(float(E[i]), float(F_before[i]), float(K[i])) for i in df_norm.index]
+                after_status = [_classify_status(float(E[i]), float(F_after[i]), float(K[i])) for i in df_norm.index]
 
                 total_posE = int((E > 0).sum())
                 yellow_after = sum(1 for s in after_status if s == "Yellow")
@@ -1870,7 +1887,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         )
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=[f"AND($E2>0,$H2<=$I2*{RED_MULT:.1f})"], fill=red, stopIfTrue=True),
+            FormulaRule(formula=[f"AND($E2>0,$H2<$I2*{1.81:.1f})"], fill=red, stopIfTrue=True),
         )
 
     bio.seek(0)
