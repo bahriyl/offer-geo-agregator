@@ -891,7 +891,9 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     dfw.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in dfw.columns]
 
     E = pd.to_numeric(dfw.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
-    F = _normalize_money(dfw.get("Total spend", pd.Series(0.0, index=dfw.index))).fillna(0.0)
+    F_original = _normalize_money(
+        dfw.get("Total spend", pd.Series(0.0, index=dfw.index))
+    ).fillna(0.0)
     K = _normalize_money(dfw.get("Total Dep Amount", pd.Series(0.0, index=dfw.index))).fillna(0.0)
     T = pd.to_numeric(dfw.get("Total+%", 0.0), errors="coerce").fillna(0.0)
     targets, target_ints = _extract_targets(dfw)
@@ -905,94 +907,66 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
     )
     row_allowance = pd.to_numeric(row_allowance, errors="coerce").clip(lower=0.0).fillna(0.0)
 
-    available_budget = float(F.sum())
-    order = T.sort_values(ascending=True).index.tolist()
-    order_by_total_spend = F.sort_values(ascending=True).index.tolist()
-    spend_order = order_by_total_spend
+    available_budget = float(F_original.sum())
+
+    partner_series = dfw.get(
+        "Partner",
+        dfw.get("Offer ID", dfw.get("Назва Офферу", pd.Series([""] * len(dfw), index=dfw.index))),
+    )
+    partner_series = partner_series.fillna("").astype(str)
+    geo_series = dfw.get("ГЕО", pd.Series([""] * len(dfw), index=dfw.index)).fillna("").astype(str)
+
+    order_df = pd.DataFrame(
+        {
+            "original_spend": F_original,
+            "partner": partner_series,
+            "geo": geo_series,
+            "__pos": np.arange(len(dfw), dtype=int),
+        },
+        index=dfw.index,
+    )
+    spend_order = (
+        order_df.sort_values(
+            by=["original_spend", "partner", "geo", "__pos"],
+            ascending=[True, True, True, True],
+            kind="mergesort",
+        ).index.tolist()
+    )
+
     alloc = pd.Series(0.0, index=dfw.index, dtype=float)
     rem = available_budget
 
-    # Крок 1: переводимо green у yellow
+    yellow_caps = thresholds["yellow_soft_ceiling"].fillna(0.0).clip(lower=0.0)
+    red_caps = thresholds["red_ceiling"].fillna(0.0).clip(lower=0.0)
+
     for idx in spend_order:
         if rem <= 1e-9:
             break
-        allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
-        if allowance_left <= 1e-9:
+        if float(E.at[idx]) <= 0:
             continue
-        ei = float(E.at[idx])
-        if ei <= 0:
-            continue
-        ki = float(K.at[idx])
-        f_cur = float(alloc.at[idx])
-        status_now = _classify_status(ei, f_cur, ki, float(targets.at[idx]))
-        if status_now != "Green":
-            continue
-        target_yellow = _compute_make_yellow_target(ei, f_cur, ki, thresholds.loc[idx])
-        if target_yellow is None:
-            continue
-        max_target = min(target_yellow, float(row_allowance.at[idx]))
-        need = max_target - f_cur
+        cap = min(float(yellow_caps.at[idx]), float(row_allowance.at[idx]))
+        cap = max(cap, 0.0)
+        need = cap - float(alloc.at[idx])
         if need <= 1e-9:
             continue
-        give = min(rem, need, allowance_left)
+        give = min(rem, need)
         if give <= 1e-9:
             continue
         alloc.at[idx] += give
         rem -= give
 
-    # Крок 2: насичуємо yellow в межах нових правил
     if rem > 1e-9:
-        F_mid = alloc.copy()
-        status_mid = pd.Series([
-            _classify_status(float(E.at[i]), float(F_mid.at[i]), float(K.at[i]), float(targets.at[i]))
-            for i in dfw.index
-        ], index=dfw.index)
-        is_yellow_mid = status_mid == "Yellow"
-
-        yellow_limit = pd.Series(0.0, index=dfw.index, dtype=float)
-        for idx in dfw.index:
-            if not is_yellow_mid.at[idx]:
-                continue
-            limit_val = _compute_yellow_limit(float(E.at[idx]), float(F_mid.at[idx]), float(K.at[idx]), thresholds.loc[idx])
-            limit_val = min(limit_val, float(row_allowance.at[idx]))
-            yellow_limit.at[idx] = max(limit_val, float(F_mid.at[idx]))
-
-        headroom = (yellow_limit - F_mid).clip(lower=0.0)
-
         for idx in spend_order:
-            if rem <= 1e-9:
-                break
-            if not is_yellow_mid.at[idx]:
-                continue
-            head = float(headroom.at[idx])
-            if head <= 1e-9:
-                continue
-            allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
-            if allowance_left <= 1e-9:
-                continue
-            give = min(rem, head, allowance_left)
-            if give <= 1e-9:
-                continue
-            alloc.at[idx] += give
-            rem -= give
-
-    # Крок 3: доводимо до червоного стелі, якщо бюджет ще лишився
-    if rem > 1e-9:
-        red_caps = thresholds["red_ceiling"].fillna(0.0)
-        for idx in order_by_total_spend:
             if rem <= 1e-9:
                 break
             if float(E.at[idx]) <= 0:
                 continue
-            allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
-            if allowance_left <= 1e-9:
-                continue
             cap = min(float(red_caps.at[idx]), float(row_allowance.at[idx]))
-            current = float(alloc.at[idx])
-            need = cap - current
+            cap = max(cap, 0.0)
+            need = cap - float(alloc.at[idx])
             if need <= 1e-9:
                 continue
-            give = min(rem, need, allowance_left)
+            give = min(rem, need)
             if give <= 1e-9:
                 continue
             alloc.at[idx] += give
@@ -1004,7 +978,8 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
         for i in dfw.index
     ], index=dfw.index)
 
-    dfw["Allocated extra"] = F_final - F
+    dfw["Total spend"] = F_final
+    dfw["Allocated extra"] = F_final
     dfw["New Total spend"] = F_final
     dfw["Will be yellow"] = ["Yes" if statuses_final.at[i] == "Yellow" else "No" for i in dfw.index]
 
