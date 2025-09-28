@@ -676,7 +676,7 @@ def _build_threshold_table(E: pd.Series, K: pd.Series, targets: pd.Series, targe
         green_cpa_limit = np.where(e > 0, (tint * e) / 1.3, 0.0)
         deposit_break = np.where((k > 0) & (DEPOSIT_GREEN_MIN > 0), (100.0 * k) / (1.3 * DEPOSIT_GREEN_MIN), 0.0)
         yellow_soft = np.where(e > 0, (t * YELLOW_MULT * e) / 1.3, 0.0)
-        red_limit = np.where(e > 0, (t * RED_MULT * e) / 1.8, 0.0)
+        red_limit = np.where(e > 0, (t * RED_MULT * e) / 1.3, 0.0)
 
     red_ceiling = np.maximum(red_limit - EPS_YEL, 0.0)
     yellow_soft = np.minimum(yellow_soft, red_ceiling)
@@ -1230,7 +1230,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
         ws.conditional_formatting.add(data_range, FormulaRule(formula=[yellow_formula], fill=yellow,
                                                               stopIfTrue=True))
         ws.conditional_formatting.add(data_range,
-                                      FormulaRule(formula=[f"AND($E2>0,$H2<$I2*{1.81:.1f})"], fill=red, stopIfTrue=True))
+                                      FormulaRule(formula=[f"AND($E2>0,$H2<=$I2*{1.81:.1f})"], fill=red, stopIfTrue=True))
 
 
 # ===================== BOT HANDLERS =====================
@@ -1887,7 +1887,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         )
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=[f"AND($E2>0,$H2<$I2*{1.81:.1f})"], fill=red, stopIfTrue=True),
+            FormulaRule(formula=[f"AND($E2>0,$H2<=$I2*{1.81:.1f})"], fill=red, stopIfTrue=True),
         )
 
     bio.seek(0)

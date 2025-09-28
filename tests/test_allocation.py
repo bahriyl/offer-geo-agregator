@@ -16,6 +16,8 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("BOT_TOKEN", "0:TEST")
 
 from main import (  # noqa: E402
+    EPS_YEL,
+    RED_MULT,
     _build_threshold_table,
     _extract_targets,
     compute_allocation_max_yellow,
@@ -44,6 +46,13 @@ def test_allocation_continues_to_red_cap_when_budget_remains():
 
     red_caps = thresholds["red_ceiling"].astype(float)
     yellow_caps = thresholds["yellow_soft_ceiling"].astype(float)
+
+    expected_red_caps = (
+        (targets.to_numpy(dtype=float) * RED_MULT * E.to_numpy(dtype=float)) / 1.3
+    ) - EPS_YEL
+    expected_red_caps = np.maximum(expected_red_caps, 0.0)
+
+    np.testing.assert_allclose(red_caps.to_numpy(dtype=float), expected_red_caps, rtol=1e-6, atol=1e-6)
 
     assert float(df["Total spend"].sum()) > float(yellow_caps.sum()) + 1e-6
 
@@ -301,7 +310,7 @@ def test_allocation_explanation_reflects_custom_targets_in_status_counts():
         {
             "Назва Офферу": ["Offer X"],
             "ГЕО": ["UA"],
-            "FTD qty": [10],
+            "FTD qty": [11],
             "Total spend": [50.0],
             "Total Dep Amount": [400.0],
             "Total+%": [120.0],
