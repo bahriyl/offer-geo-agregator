@@ -22,7 +22,7 @@ bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 CPA_TARGET_DEFAULT = 8.0
 CPA_TARGET_INT = int(CPA_TARGET_DEFAULT)
-YELLOW_MULT = 1.3
+YELLOW_MULT = 1.31
 RED_MULT = 1.8
 DEPOSIT_GREEN_MIN = 39.0
 EPS = 1e-12
@@ -41,7 +41,7 @@ def _build_yellow_formula(row: int = 2) -> str:
     return (
         f"AND($E{row_ref}>0,"
         f"OR("
-        f"AND($L{row_ref}>{DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<$I{row_ref}*{1.31:.2f}),"
+        f"AND($L{row_ref}>{DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<$I{row_ref}*{YELLOW_MULT:.2f}),"
         f"AND($L{row_ref}<={DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<=INT($I{row_ref})+1)"
         f")"
         f")"
