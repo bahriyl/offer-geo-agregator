@@ -675,12 +675,15 @@ def _build_threshold_table(E: pd.Series, K: pd.Series, targets: pd.Series, targe
     with np.errstate(divide='ignore', invalid='ignore'):
         green_cpa_limit = np.where(e > 0, (tint * e) / 1.3, 0.0)
         deposit_break = np.where((k > 0) & (DEPOSIT_GREEN_MIN > 0), (100.0 * k) / (1.3 * DEPOSIT_GREEN_MIN), 0.0)
-        yellow_soft = np.where(e > 0, (t * YELLOW_MULT * e) / 1.3, 0.0)
-        red_limit = np.where(e > 0, (t * RED_MULT * e) / 1.3, 0.0)
+        yellow_soft_raw = np.where(e > 0, (t * YELLOW_MULT * e) / 1.3, 0.0)
+        red_limit_raw = np.where(e > 0, (t * RED_MULT * e) / 1.3, 0.0)
 
-    red_ceiling = np.maximum(red_limit - EPS_YEL, 0.0)
-    yellow_soft = np.minimum(yellow_soft, red_ceiling)
+    red_ceiling = np.maximum(red_limit_raw - EPS_YEL, 0.0)
+    red_floor = np.minimum(yellow_soft_raw, red_ceiling)
+    red_floor = np.maximum(red_floor - EPS_YEL, 0.0)
+    yellow_soft = np.minimum(np.maximum(yellow_soft_raw - EPS_YEL, 0.0), red_floor)
     green_ceiling = np.minimum(green_cpa_limit, np.maximum(deposit_break - EPS_YEL, 0.0))
+    green_ceiling = np.minimum(green_ceiling, red_floor)
 
     return pd.DataFrame({
         "target": t,
@@ -688,6 +691,7 @@ def _build_threshold_table(E: pd.Series, K: pd.Series, targets: pd.Series, targe
         "green_cpa_limit": green_cpa_limit,
         "deposit_break": deposit_break,
         "green_ceiling": green_ceiling,
+        "red_floor": red_floor,
         "yellow_soft_ceiling": yellow_soft,
         "red_ceiling": red_ceiling,
     }, index=E.index)
@@ -719,6 +723,10 @@ def _compute_make_yellow_target(e: float, f_cur: float, k: float, thresholds_row
     if yellow_soft > 0:
         candidates = [min(c, yellow_soft) for c in candidates]
 
+    red_floor = float(thresholds_row.get("red_floor", 0.0))
+    if red_floor > 0:
+        candidates = [min(c, red_floor) for c in candidates]
+
     target_value = min(candidates)
     return target_value if target_value > f_cur + EPS else None
 
@@ -732,6 +740,11 @@ def _compute_yellow_limit(e: float, f_cur: float, k: float, thresholds_row: pd.S
         limit = float(thresholds_row.get("yellow_soft_ceiling", 0.0))
     else:
         limit = max(0.0, float(thresholds_row.get("green_cpa_limit", 0.0)) - EPS_YEL)
+
+    red_floor = float(thresholds_row.get("red_floor", 0.0))
+    if red_floor > 0:
+        limit = min(limit, red_floor)
+
     return min(max(limit, 0.0), red_ceiling)
 
 
@@ -743,20 +756,20 @@ def _classify_status(E: float, F: float, K: float, target: Optional[float] = Non
     deposit_pct = _calc_deposit_pct(K, F)
 
     deposit_green_cutoff = DEPOSIT_GREEN_MIN + DEPOSIT_TOL
-    yellow_upper_bound = target_val * YELLOW_MULT
+    red_lower_bound = target_val * YELLOW_MULT
     red_upper_bound = target_val * RED_MULT
 
     if (deposit_pct > deposit_green_cutoff) and (cpa <= target_int + CPA_TOL):
         return "Green"
 
     if deposit_pct > deposit_green_cutoff:
-        if (cpa >= target_int - CPA_TOL) and (cpa < yellow_upper_bound - CPA_TOL):
+        if (cpa >= target_int - CPA_TOL) and (cpa < red_lower_bound - CPA_TOL):
             return "Yellow"
     else:
         if cpa <= target_int - CPA_TOL:
             return "Yellow"
 
-    if cpa > red_upper_bound + CPA_TOL:
+    if (cpa >= red_lower_bound - CPA_TOL) and (cpa <= red_upper_bound + CPA_TOL):
         return "Red"
 
     return "Grey"
@@ -862,7 +875,7 @@ def build_allocation_explanation(df_source: pd.DataFrame,
         f"Розподіл бюджету: {used:.2f} / {total_budget:.2f} використано; залишок {left:.2f}\n"
         f"Жовтих ДО/ПІСЛЯ: {yellow_before} → {yellow_after} (зел.→жовт.: {green_to_yellow})\n"
         f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — або депозит>{DEPOSIT_GREEN_MIN:.0f}% із CPA в діапазоні [INT(target); target×{YELLOW_MULT:.2f}),"
-        f" або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target); red — CPA>target×{RED_MULT:.1f}."
+        f" або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target); red — CPA в межах [target×{YELLOW_MULT:.2f}; target×{RED_MULT:.1f}]."
     )
 
     header = html.escape(header)
@@ -881,9 +894,9 @@ def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float
       - доступний глобальний бюджет = вся поточна сума в колонці "Total spend";
       - розподіл іде за зростанням Target: спершу переводимо green у yellow,
         потім (якщо лишилися кошти) насичуємо жовті в межах CPA < target×YELLOW_MULT
-        та не перетинаючи межу target×RED_MULT, а за наявності залишку доводимо
-        рядки до червоного порогу (red_ceiling), де перевищення target×RED_MULT
-        стає червоною зоною.
+        та не виходячи за межі [target×YELLOW_MULT; target×RED_MULT], а за наявності
+        залишку доводимо рядки до червоного порогу (red_ceiling), де CPA в діапазоні
+        [target×YELLOW_MULT; target×RED_MULT] відповідає червоній зоні.
     Повертає оновлену таблицю, фактично розподілений бюджет та фінальні значення spend по рядках.
     """
 
@@ -992,7 +1005,7 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
     """
     Алгоритм нового розподілу:
       A) Мінімально переводимо GREEN → YELLOW (рухаємо CPA до INT(target) або депозит до 39%, не перетинаючи червону межу).
-      B) Якщо залишився бюджет — насичуємо жовті, але тримаємося в межах CPA < target×YELLOW_MULT та не перетинаємо червону межу target×RED_MULT (перевищення → Red).
+      B) Якщо залишився бюджет — насичуємо жовті, але тримаємося в межах CPA < target×YELLOW_MULT та не заходимо у червону зону [target×YELLOW_MULT; target×RED_MULT] (ця зона → Red).
 
     Позначення:
       E = FTD qty,
@@ -1092,7 +1105,7 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
         f"Бюджет: {budget:.2f}\n"
         f"Жовтих після розподілу: {kept_yellow}/{total_posE}\n"
         f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — тримаємо CPA нижче target×{YELLOW_MULT:.2f} "
-        f"(або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target)), red — CPA>target×{RED_MULT:.1f}."
+        f"(або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target)), red — CPA в межах [target×{YELLOW_MULT:.2f}; target×{RED_MULT:.1f}]."
     )
     return dfw, summary, alloc
 
@@ -1208,7 +1221,9 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
         ws.conditional_formatting.add(
             data_range,
             FormulaRule(
-                formula=[f"AND($E2>0,$H2>$I2*{RED_MULT:.2f})"],
+                formula=[
+                    f"AND($E2>0,$H2>=$I2*{YELLOW_MULT:.2f},$H2<=$I2*{RED_MULT:.2f})"
+                ],
                 fill=red,
                 stopIfTrue=True,
             ),
@@ -1870,7 +1885,9 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         ws.conditional_formatting.add(
             data_range,
             FormulaRule(
-                formula=[f"AND($E2>0,$H2>$I2*{RED_MULT:.2f})"],
+                formula=[
+                    f"AND($E2>0,$H2>=$I2*{YELLOW_MULT:.2f},$H2<=$I2*{RED_MULT:.2f})"
+                ],
                 fill=red,
                 stopIfTrue=True,
             ),

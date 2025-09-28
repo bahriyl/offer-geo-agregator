@@ -223,39 +223,56 @@ def test_classify_status_marks_red_only_above_cutoff_and_excel_rule_matches():
     target = 8.0
     red_cutoff = target * main_mod.RED_MULT
 
-    cpa_below = red_cutoff - 0.1
-    f_below = (cpa_below * e) / 1.3
-    deposit_below = 1.3 * f_below * 0.5
-    assert main_mod._classify_status(e, f_below, deposit_below, target) == "Grey"
+    cpa_yellow_edge = target * main_mod.YELLOW_MULT - 0.05
+    f_yellow_edge = (cpa_yellow_edge * e) / 1.3
+    deposit_yellow_edge = 1.3 * f_yellow_edge * 0.5
+    assert main_mod._classify_status(e, f_yellow_edge, deposit_yellow_edge, target) == "Yellow"
+
+    cpa_lower = target * main_mod.YELLOW_MULT
+    f_lower = (cpa_lower * e) / 1.3
+    deposit_lower = 1.3 * f_lower * 0.5
+    status_lower = main_mod._classify_status(e, f_lower, deposit_lower, target)
+    assert status_lower == "Red"
+
+    cpa_mid = target * (main_mod.YELLOW_MULT + main_mod.RED_MULT) / 2
+    f_mid = (cpa_mid * e) / 1.3
+    deposit_mid = 1.3 * f_mid * 0.5
+    status_mid = main_mod._classify_status(e, f_mid, deposit_mid, target)
+    assert status_mid == "Red"
 
     cpa_equal = red_cutoff
     f_equal = (cpa_equal * e) / 1.3
     deposit_equal = 1.3 * f_equal * 0.5
     status_equal = main_mod._classify_status(e, f_equal, deposit_equal, target)
-    assert status_equal == "Grey"
+    assert status_equal == "Red"
 
-    cpa_above = red_cutoff + 0.1
-    f_above = (cpa_above * e) / 1.3
-    deposit_above = 1.3 * f_above * 0.5
-    status_above = main_mod._classify_status(e, f_above, deposit_above, target)
-    assert status_above == "Red"
+    cpa_far = red_cutoff + 1.0
+    f_far = (cpa_far * e) / 1.3
+    deposit_far = 1.3 * f_far * 0.5
+    assert main_mod._classify_status(e, f_far, deposit_far, target) == "Grey"
 
     df = pd.DataFrame(
         {
-            "Subid": ["s_below", "s_equal", "s_above"],
-            "Offer ID": ["o1", "o2", "o3"],
-            "Назва Офферу": ["Offer", "Offer", "Offer"],
-            "ГЕО": ["G1", "G2", "G3"],
-            "FTD qty": [e, e, e],
-            "Total spend": [0.0, 0.0, 0.0],
-            "Total Dep Amount": [deposit_below, deposit_equal, deposit_above],
-            "CPA Target": [target, target, target],
+            "Subid": ["s_yellow", "s_lower", "s_mid", "s_upper", "s_far"],
+            "Offer ID": ["o1", "o2", "o3", "o4", "o5"],
+            "Назва Офферу": ["Offer", "Offer", "Offer", "Offer", "Offer"],
+            "ГЕО": ["G1", "G2", "G3", "G4", "G5"],
+            "FTD qty": [e, e, e, e, e],
+            "Total spend": [0.0, 0.0, 0.0, 0.0, 0.0],
+            "Total Dep Amount": [
+                deposit_yellow_edge,
+                deposit_lower,
+                deposit_mid,
+                deposit_equal,
+                deposit_far,
+            ],
+            "CPA Target": [target, target, target, target, target],
         },
-        index=["s_below", "s_equal", "s_above"],
+        index=["s_yellow", "s_lower", "s_mid", "s_upper", "s_far"],
     )
 
     bio = io.BytesIO()
-    new_spend = pd.Series([f_below, f_equal, f_above], index=df.index)
+    new_spend = pd.Series([f_yellow_edge, f_lower, f_mid, f_equal, f_far], index=df.index)
     main_mod.write_result_like_excel_with_new_spend(
         bio,
         df,
@@ -266,17 +283,23 @@ def test_classify_status_marks_red_only_above_cutoff_and_excel_rule_matches():
     wb = load_workbook(bio)
     ws = wb["Result"]
 
-    eq_row_excel = df.index.get_loc("s_equal") + 2
-    e_cell = ws[f"E{eq_row_excel}"]
-    f_cell = ws[f"F{eq_row_excel}"]
-    i_cell = ws[f"I{eq_row_excel}"]
+    upper_row_excel = df.index.get_loc("s_upper") + 2
+    lower_row_excel = df.index.get_loc("s_lower") + 2
+
+    e_cell = ws[f"E{upper_row_excel}"]
+    f_cell = ws[f"F{upper_row_excel}"]
+    i_cell = ws[f"I{upper_row_excel}"]
 
     assert e_cell.value == pytest.approx(e)
     assert f_cell.value == pytest.approx(f_equal, rel=0, abs=1e-6)
 
     computed_cpa = 1.3 * f_cell.value / e_cell.value
     assert computed_cpa == pytest.approx(red_cutoff)
-    assert computed_cpa >= i_cell.value * main_mod.RED_MULT - main_mod.CPA_TOL
+    assert computed_cpa >= i_cell.value * main_mod.YELLOW_MULT - main_mod.CPA_TOL
+    assert computed_cpa <= i_cell.value * main_mod.RED_MULT + main_mod.CPA_TOL
+
+    lower_cpa = 1.3 * ws[f"F{lower_row_excel}"].value / ws[f"E{lower_row_excel}"].value
+    assert lower_cpa == pytest.approx(target * main_mod.YELLOW_MULT)
 
     red_rule_formulae = []
     for rules in ws.conditional_formatting._cf_rules.values():
@@ -287,10 +310,14 @@ def test_classify_status_marks_red_only_above_cutoff_and_excel_rule_matches():
             if isinstance(formulas, str):
                 formulas = [formulas]
             for formula in formulas:
-                if "$H2>$I2" in formula:
+                if "$H2>$I2" in formula or "$H2>=$I2" in formula:
                     red_rule_formulae.append(formula)
 
-    assert any(f"$H2>$I2*{main_mod.RED_MULT:.2f}" in f for f in red_rule_formulae)
+    assert any(
+        (f"$H2>=$I2*{main_mod.YELLOW_MULT:.2f}" in f)
+        and (f"$H2<=$I2*{main_mod.RED_MULT:.2f}" in f)
+        for f in red_rule_formulae
+    )
 
 
 def test_allocation_explanation_reflects_custom_targets_in_status_counts():
@@ -319,7 +346,7 @@ def test_allocation_explanation_reflects_custom_targets_in_status_counts():
     )
 
     assert "Жовтих ДО/ПІСЛЯ: 1 → 0" in explanation
-    assert "Yellow → Grey" in explanation
+    assert "Yellow → Red" in explanation
 
 
 def test_read_result_allocation_table_handles_formula_total_plus_percent(tmp_path):
