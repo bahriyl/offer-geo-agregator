@@ -65,30 +65,55 @@ def _prep_allocation_inputs(main_mod, df):
     dfw = df.copy()
     dfw.columns = [str(c).strip() for c in dfw.columns]
     E = pd.to_numeric(dfw.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
-    F = main_mod._normalize_money(dfw.get("Total spend", pd.Series(0.0, index=dfw.index))).fillna(0.0)
+    F_original = main_mod._normalize_money(
+        dfw.get("Total spend", pd.Series(0.0, index=dfw.index))
+    ).fillna(0.0)
     K = main_mod._normalize_money(dfw.get("Total Dep Amount", pd.Series(0.0, index=dfw.index))).fillna(0.0)
     T = pd.to_numeric(dfw.get("Total+%", 0.0), errors="coerce").fillna(0.0)
     targets, target_ints = main_mod._extract_targets(dfw)
     thresholds = main_mod._build_threshold_table(E, K, targets, target_ints)
 
     stop_before_red = thresholds["red_ceiling"].fillna(0.0)
-    target_delta = (T - F).clip(lower=0.0)
-    red_headroom = (stop_before_red - F).clip(lower=0.0)
     row_allowance = pd.Series(
-        np.minimum(target_delta.to_numpy(), red_headroom.to_numpy()),
+        np.minimum(T.to_numpy(), stop_before_red.to_numpy()),
+        index=dfw.index,
+    ).clip(lower=0.0)
+
+    partner_series = dfw.get(
+        "Partner",
+        dfw.get("Offer ID", dfw.get("Назва Офферу", pd.Series([""] * len(dfw), index=dfw.index))),
+    )
+    partner_series = partner_series.fillna("").astype(str)
+    geo_series = dfw.get("ГЕО", pd.Series([""] * len(dfw), index=dfw.index)).fillna("").astype(str)
+
+    order_df = pd.DataFrame(
+        {
+            "original_spend": F_original,
+            "partner": partner_series,
+            "geo": geo_series,
+            "__pos": np.arange(len(dfw), dtype=int),
+        },
         index=dfw.index,
     )
-    row_allowance = pd.to_numeric(row_allowance, errors="coerce").fillna(0.0)
+
+    spend_order = order_df.sort_values(
+        by=["original_spend", "partner", "geo", "__pos"],
+        ascending=[True, True, True, True],
+        kind="mergesort",
+    ).index.tolist()
 
     return {
         "E": E,
-        "F": F,
+        "F_original": F_original,
         "K": K,
         "T": T,
         "targets": targets,
         "thresholds": thresholds,
         "row_allowance": row_allowance,
-        "available_budget": float(target_delta.sum()),
+        "yellow_caps": thresholds["yellow_soft_ceiling"].fillna(0.0).clip(lower=0.0),
+        "red_caps": stop_before_red,
+        "available_budget": float(F_original.sum()),
+        "order": spend_order,
     }
 
 
@@ -107,94 +132,60 @@ def test_low_spend_row_receives_leftover_before_high_spend():
     )
 
     inputs = _prep_allocation_inputs(main_mod, df)
-    E = inputs["E"]
-    F = inputs["F"]
-    K = inputs["K"]
-    targets = inputs["targets"]
-    thresholds = inputs["thresholds"]
+    order = inputs["order"]
     row_allowance = inputs["row_allowance"]
+    yellow_caps = inputs["yellow_caps"]
+    red_caps = inputs["red_caps"].clip(lower=0.0)
+    F_original = inputs["F_original"]
     rem = inputs["available_budget"]
 
-    spend_order = F.sort_values(ascending=True).index.tolist()
-    alloc = pd.Series(0.0, index=df.index, dtype=float)
+    alloc_expected = pd.Series(0.0, index=df.index, dtype=float)
 
-    F_now = F.copy()
-    for idx in spend_order:
+    for idx in order:
         if rem <= 1e-9:
             break
-        allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
-        if allowance_left <= 1e-9:
+        if float(inputs["E"].at[idx]) <= 0:
             continue
-        ei = float(E.at[idx])
-        if ei <= 0:
-            continue
-        ki = float(K.at[idx])
-        f_cur = float(F_now.at[idx])
-        status_now = main_mod._classify_status(ei, f_cur, ki, float(targets.at[idx]))
-        if status_now != "Green":
-            continue
-        target_yellow = main_mod._compute_make_yellow_target(ei, f_cur, ki, thresholds.loc[idx])
-        if target_yellow is None:
-            continue
-        max_target = min(target_yellow, float(F.at[idx] + row_allowance.at[idx]))
-        need = max_target - f_cur
+        cap = min(float(yellow_caps.at[idx]), float(row_allowance.at[idx]))
+        cap = max(cap, 0.0)
+        need = cap - float(alloc_expected.at[idx])
         if need <= 1e-9:
             continue
-        give = min(rem, need, allowance_left)
-        if give <= 1e-9:
-            continue
-        alloc.at[idx] += give
-        F_now.at[idx] += give
+        give = min(rem, need)
+        alloc_expected.at[idx] += give
         rem -= give
 
-    F_mid = F + alloc
-    status_mid = pd.Series(
-        [
-            main_mod._classify_status(float(E.at[i]), float(F_mid.at[i]), float(K.at[i]), float(targets.at[i]))
-            for i in df.index
-        ],
-        index=df.index,
-    )
-    yellow_limit = pd.Series(0.0, index=df.index, dtype=float)
-    for idx in df.index:
-        if status_mid.at[idx] != "Yellow":
-            continue
-        limit_val = main_mod._compute_yellow_limit(
-            float(E.at[idx]),
-            float(F_mid.at[idx]),
-            float(K.at[idx]),
-            thresholds.loc[idx],
-        )
-        limit_val = min(limit_val, float(F.at[idx] + row_allowance.at[idx]))
-        yellow_limit.at[idx] = max(limit_val, float(F_mid.at[idx]))
-    headroom = (yellow_limit - F_mid).clip(lower=0.0)
-
-    low_idx = F.idxmin()
-    high_idx = F.idxmax()
-    assert low_idx != high_idx
-
-    def _first_recipient(order):
+    if rem > 1e-9:
         for idx in order:
-            if headroom.at[idx] <= 1e-9:
+            if rem <= 1e-9:
+                break
+            if float(inputs["E"].at[idx]) <= 0:
                 continue
-            allowance_left = float(row_allowance.at[idx] - alloc.at[idx])
-            if allowance_left <= 1e-9:
+            cap = min(float(red_caps.at[idx]), float(row_allowance.at[idx]))
+            cap = max(cap, 0.0)
+            need = cap - float(alloc_expected.at[idx])
+            if need <= 1e-9:
                 continue
-            return idx
-        return None
+            give = min(rem, need)
+            alloc_expected.at[idx] += give
+            rem -= give
 
-    first_new = _first_recipient(spend_order)
-    first_old = _first_recipient(headroom.sort_values(ascending=False).index.tolist())
+    result_df, used_budget, alloc_vec = main_mod.compute_allocation_max_yellow(df)
 
-    assert first_new == low_idx
-    assert first_old == high_idx
-    assert first_new != first_old
+    np.testing.assert_allclose(
+        alloc_vec.to_numpy(dtype=float),
+        alloc_expected.to_numpy(dtype=float),
+        rtol=1e-9,
+        atol=1e-9,
+    )
+    assert used_budget == pytest.approx(float(alloc_expected.sum()))
 
-    _, _, alloc_result = main_mod.compute_allocation_max_yellow(df)
-    assert alloc_result.at[low_idx] > 0.0
-    assert alloc_result.at[high_idx] > 0.0
-    alloc_delta = alloc_result - F
-    assert alloc_delta.at[low_idx] == pytest.approx(row_allowance.at[low_idx])
+    low_idx = F_original.sort_values(ascending=True).index[0]
+    high_idx = F_original.sort_values(ascending=True).index[-1]
+    expected_low_cap = min(float(red_caps.at[low_idx]), float(row_allowance.at[low_idx]))
+    assert alloc_vec.at[low_idx] == pytest.approx(expected_low_cap)
+
+    assert result_df.loc[low_idx, "Allocated extra"] == pytest.approx(alloc_vec.at[low_idx])
 
 
 def test_allocation_parses_currency_strings_with_non_standard_formats():
@@ -327,8 +318,8 @@ def test_allocation_explanation_reflects_custom_targets_in_status_counts():
         alloc_is_delta=False,
     )
 
-    assert "Жовтих ДО/ПІСЛЯ: 0 → 0" in explanation
-    assert "Grey → Grey" in explanation
+    assert "Жовтих ДО/ПІСЛЯ: 1 → 0" in explanation
+    assert "Yellow → Grey" in explanation
 
 
 def test_read_result_allocation_table_handles_formula_total_plus_percent(tmp_path):
