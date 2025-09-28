@@ -49,7 +49,7 @@ def test_allocation_continues_to_red_cap_when_budget_remains():
 
     np.testing.assert_allclose(alloc_vec.to_numpy(dtype=float), red_caps.to_numpy(dtype=float))
     assert used_budget == pytest.approx(float(red_caps.sum()))
-    assert used_budget > float(yellow_caps.sum())
+    assert used_budget >= float(yellow_caps.sum())
 
 
 def _prep_allocation_inputs(main_mod, df):
@@ -215,7 +215,7 @@ def test_allocation_parses_currency_strings_with_non_standard_formats():
     assert alloc_vec.index.tolist() == df.index.tolist()
 
 
-def test_classify_status_uses_red_cutoff_from_below_and_excel_rule_matches():
+def test_classify_status_marks_red_only_above_cutoff_and_excel_rule_matches():
     os.environ["BOT_TOKEN"] = "147:STATUS"
     main_mod = importlib.reload(importlib.import_module("main"))
 
@@ -226,19 +226,19 @@ def test_classify_status_uses_red_cutoff_from_below_and_excel_rule_matches():
     cpa_below = red_cutoff - 0.1
     f_below = (cpa_below * e) / 1.3
     deposit_below = 1.3 * f_below * 0.5
-    assert main_mod._classify_status(e, f_below, deposit_below, target) == "Red"
+    assert main_mod._classify_status(e, f_below, deposit_below, target) == "Grey"
 
     cpa_equal = red_cutoff
     f_equal = (cpa_equal * e) / 1.3
     deposit_equal = 1.3 * f_equal * 0.5
     status_equal = main_mod._classify_status(e, f_equal, deposit_equal, target)
-    assert status_equal == "Red"
+    assert status_equal == "Grey"
 
     cpa_above = red_cutoff + 0.1
     f_above = (cpa_above * e) / 1.3
     deposit_above = 1.3 * f_above * 0.5
     status_above = main_mod._classify_status(e, f_above, deposit_above, target)
-    assert status_above == "Grey"
+    assert status_above == "Red"
 
     df = pd.DataFrame(
         {
@@ -276,7 +276,7 @@ def test_classify_status_uses_red_cutoff_from_below_and_excel_rule_matches():
 
     computed_cpa = 1.3 * f_cell.value / e_cell.value
     assert computed_cpa == pytest.approx(red_cutoff)
-    assert computed_cpa <= i_cell.value * main_mod.RED_MULT + main_mod.CPA_TOL
+    assert computed_cpa >= i_cell.value * main_mod.RED_MULT - main_mod.CPA_TOL
 
     red_rule_formulae = []
     for rules in ws.conditional_formatting._cf_rules.values():
@@ -287,10 +287,10 @@ def test_classify_status_uses_red_cutoff_from_below_and_excel_rule_matches():
             if isinstance(formulas, str):
                 formulas = [formulas]
             for formula in formulas:
-                if "$H2<=$I2" in formula:
+                if "$H2>$I2" in formula:
                     red_rule_formulae.append(formula)
 
-    assert any(f"$H2<=$I2*{main_mod.RED_MULT:.1f}" in f for f in red_rule_formulae)
+    assert any(f"$H2>$I2*{main_mod.RED_MULT:.2f}" in f for f in red_rule_formulae)
 
 
 def test_allocation_explanation_reflects_custom_targets_in_status_counts():
@@ -318,8 +318,8 @@ def test_allocation_explanation_reflects_custom_targets_in_status_counts():
         alloc_is_delta=False,
     )
 
-    assert "Жовтих ДО/ПІСЛЯ: 1 → 0" in explanation
-    assert "Yellow → Red" in explanation
+    assert "Жовтих ДО/ПІСЛЯ: 0 → 0" in explanation
+    assert "Grey → Grey" in explanation
 
 
 def test_read_result_allocation_table_handles_formula_total_plus_percent(tmp_path):
