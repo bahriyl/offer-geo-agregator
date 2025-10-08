@@ -1,14 +1,20 @@
 import os
 import io
 import re
-import html
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 from dotenv import load_dotenv
 
-import pandas as pd
 from telebot import TeleBot, types
+from openai import OpenAI
 import numpy as np
+import pandas as pd
+from pandas import ExcelWriter
+from typing import Optional
+
 from datetime import datetime
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import PatternFill
 
 load_dotenv()
 
@@ -18,39 +24,45 @@ MAIN_SHEET_NAME = "BUDG"  # read this sheet from the main file
 ALLOWED_MAIN_COLUMNS = ["Назва Офферу", "ГЕО", "Загальні витрати"]
 ADDITIONAL_REQUIRED_COLS = ["Країна", "Сума депозитів"]
 
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
+OPENAI_MAX_CHARS = 60_000  # безпечний ліміт для одного запиту
+OPENAI_OUTPUT_COLUMN = "Total spend"  # колонка, яку модель має заповнити/перерахувати
+
 bot = TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-CPA_TARGET_DEFAULT = 8.0
-CPA_TARGET_INT = int(CPA_TARGET_DEFAULT)
-YELLOW_MULT = 1.31
-RED_MULT = 1.8
-DEPOSIT_GREEN_MIN = 39.0
+H_THRESH = 9.0  # H <= 9 is "good"
+L_THRESH = 39.99  # L > 39.99 is "good" (strict >)
+CPA_CAP = 11.0
 EPS = 1e-12
 EPS_YEL = 1e-6
-CPA_TOL = 1e-9
-DEPOSIT_TOL = 1e-9
 
-
-# ===================== FORMULA HELPERS =====================
-
-
-def _build_yellow_formula(row: int = 2) -> str:
-    """Return the Excel conditional formatting formula for the yellow status."""
-
-    row_ref = str(row)
-    return (
-        f"AND($E{row_ref}>0,"
-        f"OR("
-        f"AND($L{row_ref}>{DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<$I{row_ref}*{YELLOW_MULT:.2f}),"
-        f"AND($L{row_ref}<={DEPOSIT_GREEN_MIN:.0f},$H{row_ref}<=INT($I{row_ref})+1)"
-        f")"
-        f")"
-    )
+# CPA Target defaults and overrides
+CPA_DEFAULT_TARGET = 8
+CPA_OVERRIDES: Dict[str, float] = {
+    "Аргентина": 20,
+    "Болівія": 15,
+    "Венесуела": 5,
+    "Габон": 7,
+    "Гана": 5,
+    "Еквадор": 15,
+    "Йорданія": 40,
+    "Ірак": 40,
+    "Казахстан": 30,
+    "Колумбія": 11,
+    "Малайзія": 40,
+    "Парагвай": 15,
+    "Пакистан": 15,
+    "Перу": 12,
+    "Таїланд": 22,
+    "Уругвай": 12,
+    "Філіппіни": 10,
+}
 
 
 # ===================== STATE =====================
 class UserState:
     def __init__(self):
+        self.alloc_mode = None
         self.phase = "WAIT_MAIN"  # WAIT_MAIN -> WAIT_ADDITIONAL, plus allocate flow
         self.main_agg_df: Optional[pd.DataFrame] = None
         self.offers: List[str] = []
@@ -64,7 +76,6 @@ class UserState:
         # --- allocate flow state ---
         self.alloc_df: Optional[pd.DataFrame] = None  # parsed result.xlsx
         self.alloc_budget: Optional[float] = None
-        self.alloc_mode: Optional[str] = None  # "budget" or "max_yellow"
 
 
 user_states: Dict[int, UserState] = {}
@@ -73,6 +84,9 @@ user_states: Dict[int, UserState] = {}
 # Заповни своїми Telegram ID (int). Можна зберігати у .env і парсити з ENV.
 ALLOWED_USER_IDS = {
     155840708,
+    7877906786,
+    817278554,
+    480823885
 }
 
 
@@ -115,47 +129,54 @@ def require_access_cb(handler_func):
     return wrapper
 
 
+def _df_to_csv(df: pd.DataFrame) -> str:
+    # Без індексу, максимально “плоско”
+    bio = io.StringIO()
+    df.to_csv(bio, index=False)
+    return bio.getvalue()
+
+
+def _split_df_by_size(df: pd.DataFrame, max_chars: int = OPENAI_MAX_CHARS) -> list[pd.DataFrame]:
+    """
+    Ділимо датафрейм на чанки, щоб CSV кожного не перевищував ліміт символів.
+    """
+    # груба оцінка середнього розміру рядка
+    sample = min(len(df), 20)
+    avg_row_len = len(_df_to_csv(df.head(sample))) / max(sample, 1)
+    # запас: шапка + промпт
+    rows_per_chunk = max(5, int((max_chars - 3000) / max(avg_row_len, 1)))
+    chunks = []
+    for i in range(0, len(df), rows_per_chunk):
+        chunks.append(df.iloc[i:i + rows_per_chunk].copy())
+    return chunks
+
+
+def _csv_from_text(text: str) -> str:
+    """
+    Витягує CSV з відповіді (підтримка варіантів без код-блоків та з ```csv ... ```).
+    """
+    t = text.strip()
+    if "```" in t:
+        # намагаємося знайти fenced block
+        parts = t.split("```")
+        # шукаємо блок з csv або перший код-блок
+        best = None
+        for i in range(1, len(parts), 2):
+            block = parts[i]
+            if block.lstrip().lower().startswith("csv"):
+                best = block.split("\n", 1)[1] if "\n" in block else ""
+                break
+        if best is None:
+            # беремо перший код-блок як fallback
+            best = parts[1]
+        return best.strip()
+    return t
+
+
 # ===================== NORMALIZATION (countries) =====================
 
 def normalize_text(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip().lower()
-
-
-def _normalize_money(series: pd.Series) -> pd.Series:
-    """Normalise money-like strings into numeric values."""
-    if series is None:
-        return pd.Series(dtype=float)
-
-    if isinstance(series, pd.Series):
-        ser = series.copy()
-    else:
-        ser = pd.Series(series)
-    if ser.empty:
-        return pd.to_numeric(ser, errors="coerce")
-
-    ser = ser.astype("string")
-    ser = ser.str.replace("\u00a0", "", regex=False)
-    ser = ser.str.replace("\u202f", "", regex=False)
-    ser = ser.str.strip()
-    ser = ser.str.replace(r"\s+", "", regex=True)
-    ser = ser.str.replace(r"[^0-9,\.\-]", "", regex=True)
-
-    def _harmonise_decimal(value):
-        if value is pd.NA:
-            return value
-        if value is None:
-            return pd.NA
-        text = str(value)
-        if text == "" or text in {"-", ".", ",", "-.", "-,"}:
-            return pd.NA
-        if "," in text and "." in text:
-            text = text.replace(",", "")
-        elif "," in text:
-            text = text.replace(",", ".")
-        return text
-
-    ser = ser.map(_harmonise_decimal)
-    return pd.to_numeric(ser, errors="coerce")
 
 
 def build_country_map_uk_to_en() -> Dict[str, str]:
@@ -165,17 +186,28 @@ def build_country_map_uk_to_en() -> Dict[str, str]:
         "Габон": "Gabon",
         "Гаїті": "Haiti",
         "Гана": "Ghana",
-        "Гвінея": "Guinea",
-        # ---- FIX: зводимо все до "Congo (Kinshasa)" ----
+
+        # ❗ уточнення: у XLSX зустрічається "Guinea-Conakry"
+        # щоб зв’язати з дод. таблицями, мапимо укр "Гвінея" саме на "Guinea-Conakry"
+        # (далі в каноні зведемо це до "Guinea")
+        "Гвінея": "Guinea-Conakry",
+
+        # ---- DRC/ROC ----
         "Демократична Республіка Конґо": "Congo (Kinshasa)",
         "ДР Конго": "Congo (Kinshasa)",
         "Конго (Кіншаса)": "Congo (Kinshasa)",
-        # -----------------------------------------------
         "Республіка Конго": "Congo (Brazzaville)",
         "Конго-Браззавіль": "Congo (Brazzaville)",
-        "Конго": "Congo (Kinshasa)",  # якщо пишуть просто "Конго" — приймаємо як DRC
+        # якщо просто "Конго" — за замовчуванням DRC
+        "Конго": "Congo (Kinshasa)",
+
         "Камерун": "Cameroon",
+
+        # Кот-д’Івуар — одразу кілька апострофних варіантів
         "Кот-д'Івуар": "Cote d'Ivoire",
+        "Кот-д’Івуар": "Cote d'Ivoire",
+        "Кот д’Івуар": "Cote d'Ivoire",
+
         "Кенія": "Kenya",
         "Сенегал": "Senegal",
         "Сьєрра-Леоне": "Sierra Leone",
@@ -195,13 +227,20 @@ def build_country_map_uk_to_en() -> Dict[str, str]:
         "Домініканська Республіка": "Dominican Republic",
         "Канада": "Canada",
         "Філіппіни": "Philippines",
+
+        # 🔹 додано з вашого списку «missing»
+        "Болівія": "Bolivia",
+        "Еквадор": "Ecuador",
+        "Колумбія": "Colombia",
+        "Парагвай": "Paraguay",
+        "Перу": "Peru",
     }
     return {normalize_text(k): v for k, v in m.items()}
 
 
 def build_country_canonical() -> Dict[str, str]:
     canon = {
-        # EN canonical
+        # самоканонічні EN
         "Benin": "Benin",
         "Burkina Faso": "Burkina Faso",
         "Gabon": "Gabon",
@@ -212,12 +251,6 @@ def build_country_canonical() -> Dict[str, str]:
         "Congo (Brazzaville)": "Congo (Brazzaville)",
         "Cameroon": "Cameroon",
         "Cote d'Ivoire": "Cote d'Ivoire",
-        # ---- FIX: усі синоніми до Congo (Kinshasa) ----
-        "DRC": "Congo (Kinshasa)",
-        "DR Congo": "Congo (Kinshasa)",
-        "Democratic Republic of the Congo": "Congo (Kinshasa)",
-        # -----------------------------------------------
-        "Ivory Coast": "Cote d'Ivoire",
         "Kenya": "Kenya",
         "Senegal": "Senegal",
         "Sierra Leone": "Sierra Leone",
@@ -238,42 +271,49 @@ def build_country_canonical() -> Dict[str, str]:
         "Canada": "Canada",
         "Philippines": "Philippines",
 
-        # UA → canonical EN
-        "бенін": "Benin",
-        "буркіна-фасо": "Burkina Faso",
-        "габон": "Gabon",
-        "гаїті": "Haiti",
-        "гана": "Ghana",
-        "гвінея": "Guinea",
-        # ---- FIX UA-синоніми ДРК ----
-        "демократична республіка конґо": "Congo (Kinshasa)",
-        "др конго": "Congo (Kinshasa)",
-        "конго (кіншаса)": "Congo (Kinshasa)",
-        # --------------------------------
-        "республіка конго": "Congo (Brazzaville)",
-        "конго-браззавіль": "Congo (Brazzaville)",
-        "конго": "Congo (Kinshasa)",  # дефолт у бік DRC
-        "камерун": "Cameroon",
+        # 🔹 додано з вашого списку «missing»
+        "Bolivia": "Bolivia",
+        "Ecuador": "Ecuador",
+        "Colombia": "Colombia",
+        "Paraguay": "Paraguay",
+        "Peru": "Peru",
+
+        # синоніми/варіанти написання → канон
+        # Cote d'Ivoire
+        "Cote DIvoire": "Cote d'Ivoire",
+        "Cote dIvoire": "Cote d'Ivoire",
+        "Cote D Ivoire": "Cote d'Ivoire",
+        "Cote d’ivoire": "Cote d'Ivoire",
+        "Côte d’Ivoire": "Cote d'Ivoire",
+        "Ivory Coast": "Cote d'Ivoire",
+
+        # Guinea-Conakry → Guinea
+        "Guinea-Conakry": "Guinea",
+        "Guinea Conakry": "Guinea",
+        "Guinea, Conakry": "Guinea",
+
+        # DRC/ROC варіанти
+        "DRC": "Congo (Kinshasa)",
+        "DR Congo": "Congo (Kinshasa)",
+        "Congo (DRC)": "Congo (Kinshasa)",
+        "Democratic Republic of the Congo": "Congo (Kinshasa)",
+        "Democratic Republic of Congo": "Congo (Kinshasa)",
+        "Congo-Kinshasa": "Congo (Kinshasa)",
+
+        "Republic of the Congo": "Congo (Brazzaville)",
+        "Congo Republic": "Congo (Brazzaville)",
+        "Congo-Brazzaville": "Congo (Brazzaville)",
+
+        # UA → EN канон (на випадок, якщо десь просочиться укр у дод. таблицях)
         "кот-д'івуар": "Cote d'Ivoire",
-        "кенія": "Kenya",
-        "сенегал": "Senegal",
-        "сьєрра-леоне": "Sierra Leone",
-        "танзанія": "Tanzania",
-        "того": "Togo",
-        "уганда": "Uganda",
-        "замбія": "Zambia",
-        "ефіопія": "Ethiopia",
-        "нігер": "Niger",
-        "нігерія": "Nigeria",
-        "малі": "Mali",
-        "казахстан": "Kazakhstan",
-        "іспанія": "Spain",
-        "франція": "France",
-        "італія": "Italy",
-        "португалія": "Portugal",
-        "домініканська республіка": "Dominican Republic",
-        "канада": "Canada",
-        "філіппіни": "Philippines",
+        "кот-д’івуар": "Cote d'Ivoire",
+        "кот д’івуар": "Cote d'Ivoire",
+        "гвінея": "Guinea",
+        "болівія": "Bolivia",
+        "еквадор": "Ecuador",
+        "колумбія": "Colombia",
+        "парагвай": "Paraguay",
+        "перу": "Peru",
     }
     return {normalize_text(k): v for k, v in canon.items()}
 
@@ -287,6 +327,14 @@ def to_canonical_en(country: str, uk_to_en: Dict[str, str], canonical: Dict[str,
     if key in {"конго", "congo"}:
         return "Congo (Kinshasa)"
     return country
+
+
+def cpa_target_for_geo(geo: Optional[str]) -> float:
+    try:
+        key = str(geo).strip()
+    except Exception:
+        key = ""
+    return CPA_OVERRIDES.get(key, CPA_DEFAULT_TARGET)
 
 
 # ===================== FLEXIBLE HEADER / COLUMN MATCH =====================
@@ -328,31 +376,26 @@ def match_columns(actual_cols, required_labels: List[str]) -> Optional[Dict[str,
 # ADD
 def read_excel_robust(file_bytes: bytes, sheet_name: str, header: int = 0) -> pd.DataFrame:
     """
-    Robust Excel reader with multiple fallback strategies
-    and filter: keep only rows where column 'Дата' belongs to current month.
+    Robust Excel reader with multiple fallback strategies.
+    Filters to the current month:
+      - Prefer column 'Місяць' (numeric month: 1..12).
+      - Fallback to column 'Дата' (dd/mm/YYYY).
     """
     bio = io.BytesIO(file_bytes)
     errors = []
 
     # Helper: filter to current month
     def filter_current_month(df: pd.DataFrame) -> pd.DataFrame:
-        from datetime import datetime
-        try:
-            from zoneinfo import ZoneInfo
-            now_month = datetime.now(ZoneInfo("Europe/Kyiv")).month
-        except Exception:
-            # якщо zoneinfo недоступний
-            now_month = datetime.now().month
+        cur_month = datetime.now().month
 
-        if "Місяць" not in df.columns:
-            return df.iloc[0:0]  # або підніміть помилку, якщо так зручніше
+        if "Місяць" in df.columns:
+            # Accept strings like "09", numbers like 9.0, etc.
+            month_series = pd.to_numeric(df["Місяць"], errors="coerce")
+            return df[month_series == cur_month]
 
-        out = df.copy()
-        # у стовпці можуть бути "", текст тощо — приводимо до числа
-        out["Місяць"] = pd.to_numeric(out["Місяць"], errors="coerce")
-        return out[out["Місяць"] == now_month]
+        return df
 
-    # Strategy 1: Try openpyxl with data_only=True
+    # Strategy 1: openpyxl
     try:
         bio.seek(0)
         df = pd.read_excel(bio, sheet_name=sheet_name, header=header, engine="openpyxl")
@@ -361,7 +404,7 @@ def read_excel_robust(file_bytes: bytes, sheet_name: str, header: int = 0) -> pd
         errors.append(f"openpyxl: {e}")
         print(f"openpyxl failed: {e}")
 
-    # Strategy 2: Try reading without specifying header first, then set it manually
+    # Strategy 2: openpyxl without header, set manually
     try:
         bio.seek(0)
         df_raw = pd.read_excel(bio, sheet_name=sheet_name, header=None, engine="openpyxl")
@@ -376,7 +419,7 @@ def read_excel_robust(file_bytes: bytes, sheet_name: str, header: int = 0) -> pd
         errors.append(f"openpyxl manual header: {e}")
         print(f"Manual header setting failed: {e}")
 
-    # Strategy 3: Try calamine if available
+    # Strategy 3: calamine
     try:
         bio.seek(0)
         df = pd.read_excel(bio, sheet_name=sheet_name, header=header, engine="calamine")
@@ -385,7 +428,7 @@ def read_excel_robust(file_bytes: bytes, sheet_name: str, header: int = 0) -> pd
         errors.append(f"calamine: {e}")
         print(f"calamine failed: {e}")
 
-    # Strategy 4: Try xlrd
+    # Strategy 4: xlrd
     try:
         bio.seek(0)
         df = pd.read_excel(bio, sheet_name=sheet_name, header=header, engine="xlrd")
@@ -397,7 +440,7 @@ def read_excel_robust(file_bytes: bytes, sheet_name: str, header: int = 0) -> pd
     raise ValueError(f"Could not read Excel file with any engine. Errors: {'; '.join(errors)}")
 
 
-def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.DataFrame:
+def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded", month: int | None = None) -> pd.DataFrame:
     df = None
     errors = []
 
@@ -406,7 +449,7 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.Da
             df = read_excel_robust(file_bytes, sheet_name="BUDG", header=1)
         except Exception as e1:
             errors.append(f"header=1: {e1}")
-            # (тут залишається твоя fallback-логіка для Excel)
+            # (your existing Excel fallback logic remains unchanged)
     else:
         # CSV support
         bio = io.BytesIO(file_bytes)
@@ -420,13 +463,13 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.Da
                 bio.seek(0)
                 df_raw = pd.read_csv(bio, header=None, encoding="utf-8")
 
-        # detect header row
+        # detect header row (similar to Excel logic)
         header_row = -1
         for i in range(min(10, len(df_raw))):
             row_values = [str(v).lower().strip() for v in df_raw.iloc[i].values]
             if any("назва" in val and "оффер" in val for val in row_values) and \
-               any("гео" in val for val in row_values) and \
-               any("витрат" in val for val in row_values):
+                    any("гео" in val for val in row_values) and \
+                    any("витрат" in val for val in row_values):
                 header_row = i
                 break
 
@@ -436,6 +479,17 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.Da
             df.columns = new_header
         else:
             df = df_raw
+
+        # --- filter current month ---
+        # cur_month = datetime.now().month
+        cur_month = month
+
+        if "Місяць" in df.columns:
+            df["Місяць"] = pd.to_numeric(df["Місяць"], errors="coerce")
+            df = df[df["Місяць"] == cur_month]
+        elif "Дата" in df.columns:
+            df["Дата"] = pd.to_datetime(df["Дата"], format="%d/%m/%Y", errors="coerce")
+            df = df[(df["Дата"].dt.month == cur_month) & (df["Дата"].dt.year == datetime.now().year)]
 
     if df is None:
         raise ValueError(f"Could not load BUDG sheet. Errors: {'; '.join(errors)}")
@@ -454,22 +508,8 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.Da
             f"Перевір назви колонок у файлі."
         )
 
-    df = df[[colmap["Назва Офферу"], colmap["ГЕО"], colmap["Загальні витрати"], *([c for c in df.columns if c == "Місяць"])]].copy()
-
-    # rename тільки основні колонки
-    rename_map = {
-        colmap["Назва Офферу"]: "Назва Офферу",
-        colmap["ГЕО"]: "ГЕО",
-        colmap["Загальні витрати"]: "Загальні витрати"
-    }
-    df.rename(columns=rename_map, inplace=True)
-
-    # --- фільтрація по поточному місяцю ---
-    if "Місяць" in df.columns:
-        from datetime import datetime
-        current_month = datetime.now().month
-        df["Місяць"] = pd.to_numeric(df["Місяць"], errors="coerce")
-        df = df[df["Місяць"] == current_month]
+    df = df[[colmap["Назва Офферу"], colmap["ГЕО"], colmap["Загальні витрати"]]].copy()
+    df.columns = ["Назва Офферу", "ГЕО", "Загальні витрати"]
 
     return df
 
@@ -532,92 +572,154 @@ def read_additional_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
     return df
 
 
-def read_result_allocation_table(file_bytes: bytes, filename: str) -> pd.DataFrame:
-    """Parse result.xlsx (sheet Result) and normalise required columns."""
-    if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
-        raise ValueError("Очікую файл Excel (result.xlsx) з аркушем Result.")
-
-    engines = ["openpyxl", "calamine", "xlrd"]
-    errors = []
-    df = None
-    for engine in engines:
-        try:
-            bio = io.BytesIO(file_bytes)
-            df = pd.read_excel(bio, sheet_name="Result", engine=engine)
-            break
-        except Exception as e:
-            errors.append(f"{engine}: {e}")
-
-    if df is None:
-        raise ValueError(
-            "Не вдалося прочитати аркуш Result у файлі. Спробуйте ще раз або перевірте, що файл — result.xlsx."
-            + (f" Деталі: {'; '.join(errors)}" if errors else "")
-        )
-
-    df.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in df.columns]
-
-    def _ensure_column(label: str, required: bool) -> None:
-        mapping = match_columns(df.columns, [label])
-        if mapping:
-            actual = mapping[label]
-            if actual != label:
-                df.rename(columns={actual: label}, inplace=True)
-            return
-        if required:
-            raise ValueError(f"У файлі немає очікуваної колонки \"{label}\" на аркуші Result.")
-
-    for optional_col in ["Subid", "Offer ID", "Назва Офферу", "ГЕО"]:
-        _ensure_column(optional_col, required=False)
-
-    for required_col in ["FTD qty", "Total spend", "Total Dep Amount", "Total+%"]:
-        _ensure_column(required_col, required=True)
-
-    df["FTD qty"] = pd.to_numeric(df.get("FTD qty", 0), errors="coerce").fillna(0).astype(int)
-    for col in ["Total spend", "Total Dep Amount"]:
-        series = df.get(col, pd.Series(0.0, index=df.index))
-        df[col] = _normalize_money(series).fillna(0.0).round(2)
-
-    total_plus_raw = df.get("Total+%", pd.Series(0.0, index=df.index))
-    if not isinstance(total_plus_raw, pd.Series):
-        total_plus_raw = pd.Series(total_plus_raw, index=df.index)
-
-    total_plus_numeric = _normalize_money(total_plus_raw).astype(float)
-
-    total_spend_series = df["Total spend"].astype(float)
-    total_plus_str = total_plus_raw.astype("string")
-    formula_mask = (
-        total_plus_str.str.contains(r"=", regex=False, na=False)
-        | total_plus_str.str.contains(r"[A-Za-z]", regex=True, na=False)
-    )
-
-    valid_ratio_mask = (
-        ~formula_mask
-        & np.isfinite(total_spend_series)
-        & (total_spend_series > 0)
-        & np.isfinite(total_plus_numeric)
-        & (total_plus_numeric > 0)
-    )
-
-    if valid_ratio_mask.any():
-        multiplier = float((total_plus_numeric[valid_ratio_mask] / total_spend_series[valid_ratio_mask]).median())
-    else:
-        multiplier = 1.3
-
-    needs_recompute = (
-        formula_mask
-        | ~np.isfinite(total_plus_numeric)
-        | (total_plus_numeric <= 0)
-    )
-    fallback_mask = needs_recompute & np.isfinite(total_spend_series) & (total_spend_series > 0)
-    if fallback_mask.any():
-        total_plus_numeric.loc[fallback_mask] = total_spend_series.loc[fallback_mask] * multiplier
-
-    df["Total+%"] = total_plus_numeric.fillna(0.0)
-
-    return df
-
-
 # ===================== HELPERS =====================
+
+def inject_formulas_and_cf(
+        ws,
+        *,
+        header_row: int = 1,
+        first_data_row: int = 2,
+        last_data_row: int | None = None,
+):
+    """
+    Додає формули у колонки та CF-підсвітку.
+    Очікується, що у шапці вже є принаймні колонки:
+    - 'Total spend' (F), 'FTD qty' (E), 'Total Dep Amount' (K), 'My deposit amount' (L)
+    Якщо інших колонок (Total+%, CPA, СP/Ч, Target 40/50%) немає — створимо.
+
+    Формули:
+      G: Total+%                 = Total spend * 1.3
+      H: CPA                     = Total+% / FTD qty
+      (кирилиця) 'СP/Ч'          = Total Dep Amount / FTD qty
+      'C. profit Target 40%'     = Total+% * 0.4
+      'C. profit Target 50%'     = Total+% * 0.5
+      L: My deposit amount       = Total Dep Amount / Total+% * 100
+
+    """
+
+    if last_data_row is None:
+        last_data_row = ws.max_row
+    if last_data_row < first_data_row:
+        return
+
+    # --- Map header name -> column index (створюємо, якщо треба)
+    headers = {ws.cell(row=header_row, column=c).value: c for c in range(1, ws.max_column + 1) if
+               ws.cell(row=header_row, column=c).value}
+
+    def ensure_col(name: str) -> int:
+        if name in headers:
+            return headers[name]
+        col = ws.max_column + 1
+        ws.cell(row=header_row, column=col, value=name)
+        headers[name] = col
+        return col
+
+    col_idx = {
+        "Total spend": ensure_col("Total spend"),
+        "FTD qty": ensure_col("FTD qty"),
+        "Total Dep Amount": ensure_col("Total Dep Amount"),
+        "My deposit amount": ensure_col("My deposit amount"),
+        "Total+%": ensure_col("Total+%"),
+        "CPA": ensure_col("CPA"),
+        "CPA Target": ensure_col("CPA Target"),
+        "СP/Ч": ensure_col("СP/Ч"),  # перша літера — кирилична "С"
+        "C. profit Target 40%": ensure_col("C. profit Target 40%"),
+        "C. profit Target 50%": ensure_col("C. profit Target 50%"),
+    }
+
+    # У зручні змінні — кол. літери
+    letter = {k: get_column_letter(v) for k, v in col_idx.items()}
+
+    F = letter["Total spend"]
+    E = letter["FTD qty"]
+    K = letter["Total Dep Amount"]
+    L = letter["My deposit amount"]
+    G = letter["Total+%"]
+    H = letter["CPA"]
+    I = letter["CPA Target"]
+    CPCH = letter["СP/Ч"]
+    C40 = letter["C. profit Target 40%"]
+    C50 = letter["C. profit Target 50%"]
+
+    # --- Прописуємо формули по рядках
+    for r in range(first_data_row, last_data_row + 1):
+        ws[f"{G}{r}"] = f"={F}{r}*1.3"
+        ws[f"{H}{r}"] = f"={G}{r}/{E}{r}"
+        ws[f"{CPCH}{r}"] = f"={K}{r}/{E}{r}"
+        ws[f"{C40}{r}"] = f"={G}{r}*0.4"
+        ws[f"{C50}{r}"] = f"={G}{r}*0.5"
+        # L як формула (перезаписуємо значення, якщо були)
+        ws[f"{L}{r}"] = f"={K}{r}/{G}{r}*100"
+
+    # --- Conditional Formatting (оновлені правила) ---
+    first_col_letter = get_column_letter(1)
+    last_col_letter = get_column_letter(ws.max_column)
+    data_range = f"{first_col_letter}{first_data_row}:{last_col_letter}{last_data_row}"
+
+    grey = PatternFill(start_color="BFBFBF", end_color="BFBFBF", fill_type="solid")
+    green = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+    yellow = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+    red = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+
+    # Dynamic threshold per GEO (Габон=59, else 39)
+    try:
+        GEO_col_idx = headers.get("ГЕО") or headers.get("Geo") or headers.get("GEO") or headers.get("Країна")
+        GEO = get_column_letter(GEO_col_idx) if GEO_col_idx else None
+    except Exception:
+        GEO = None
+    THR = f'IF(${GEO}{first_data_row}="Габон",59,39)' if GEO else "39"
+
+    # Grey: E = 0
+    ws.conditional_formatting.add(
+        data_range,
+        FormulaRule(formula=[f"${E}{first_data_row}=0"], fill=grey, stopIfTrue=True),
+    )
+
+    # Green: INT(H) <= INT(I) AND L > 39
+    ws.conditional_formatting.add(
+        data_range,
+        FormulaRule(
+            formula=[
+                f"AND(${E}{first_data_row}>0,INT(${H}{first_data_row})<=INT(${I}{first_data_row}),${L}{first_data_row}>{THR})"],
+            fill=green,
+            stopIfTrue=True
+        ),
+    )
+
+    # Yellow: (INT(H) <= INT(I)) OR (L > 39 AND H < I*1.31)
+    ws.conditional_formatting.add(
+        data_range,
+        FormulaRule(
+            formula=[
+                f"AND(${E}{first_data_row}>0,OR(INT(${H}{first_data_row})<=INT(${I}{first_data_row}),AND(${L}{first_data_row}>{THR},${H}{first_data_row}<${I}{first_data_row}*1.31)))"],
+            fill=yellow,
+            stopIfTrue=True
+        ),
+    )
+
+    # Red: (E > 0 AND H > I*1.3 AND L > 39) OR (E > 0 AND INT(H) > INT(I) AND L < 39)
+    ws.conditional_formatting.add(
+        data_range,
+        FormulaRule(
+            formula=[
+                f"OR(AND(${E}{first_data_row}>0,${H}{first_data_row}>${I}{first_data_row}*1.3,${L}{first_data_row}>{THR}),AND(${E}{first_data_row}>0,INT(${H}{first_data_row})>INT(${I}{first_data_row}),${L}{first_data_row}<{THR}))"],
+            fill=red,
+            stopIfTrue=True
+        ),
+    )
+
+    # --- Number format: 2 decimals for all numeric cells in data range
+    # (краще з розділювачем тисяч)
+    num_fmt = "#,##0.00"
+    for row in ws.iter_rows(
+            min_row=first_data_row,
+            max_row=last_data_row,
+            min_col=1,
+            max_col=ws.max_column
+    ):
+        for cell in row:
+            cell.number_format = num_fmt
+
 
 def ask_additional_table_with_skip(message: types.Message, state: UserState):
     offer = state.offers[state.current_offer_index]
@@ -637,142 +739,20 @@ def ask_additional_table_with_skip(message: types.Message, state: UserState):
 
 # ===================== ALLOCATION HELPERS =====================
 
-def _resolve_target_value(raw: Optional[float]) -> Tuple[float, int]:
-    value = float(raw) if raw is not None and np.isfinite(raw) and raw > 0 else CPA_TARGET_DEFAULT
-    target_int = int(np.floor(value)) if value > 0 else CPA_TARGET_INT
-    if target_int <= 0:
-        target_int = CPA_TARGET_INT
-    return value, target_int
-
-
-def _calc_cpa(e: float, f: float) -> float:
-    if e <= 0:
-        return float("inf")
-    return 1.3 * f / e
-
-
-def _calc_deposit_pct(k: float, f: float) -> float:
-    if f <= 0:
-        return float("inf")
-    return (100.0 * k) / (1.3 * f)
-
-
-def _extract_targets(df: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
-    targets = pd.to_numeric(df.get("CPA Target", CPA_TARGET_DEFAULT), errors="coerce").fillna(CPA_TARGET_DEFAULT)
-    targets = targets.where(targets > 0, CPA_TARGET_DEFAULT)
-    target_ints = np.floor(targets.to_numpy())
-    target_ints[~np.isfinite(target_ints) | (target_ints <= 0)] = CPA_TARGET_INT
-    target_ints = target_ints.astype(int)
-    return targets, pd.Series(target_ints, index=df.index)
-
-
-def _build_threshold_table(E: pd.Series, K: pd.Series, targets: pd.Series, target_ints: pd.Series) -> pd.DataFrame:
-    e = E.to_numpy(dtype=float)
-    k = K.to_numpy(dtype=float)
-    t = targets.to_numpy(dtype=float)
-    tint = target_ints.to_numpy(dtype=float)
-
-    with np.errstate(divide='ignore', invalid='ignore'):
-        green_cpa_limit = np.where(e > 0, (tint * e) / 1.3, 0.0)
-        deposit_break = np.where((k > 0) & (DEPOSIT_GREEN_MIN > 0), (100.0 * k) / (1.3 * DEPOSIT_GREEN_MIN), 0.0)
-        yellow_soft_raw = np.where(e > 0, (t * YELLOW_MULT * e) / 1.3, 0.0)
-        red_limit_raw = np.where(e > 0, (t * RED_MULT * e) / 1.3, 0.0)
-
-    red_ceiling = np.maximum(red_limit_raw - EPS_YEL, 0.0)
-    red_floor = np.minimum(yellow_soft_raw, red_ceiling)
-    red_floor = np.maximum(red_floor - EPS_YEL, 0.0)
-    yellow_soft = np.minimum(np.maximum(yellow_soft_raw - EPS_YEL, 0.0), red_floor)
-    green_ceiling = np.minimum(green_cpa_limit, np.maximum(deposit_break - EPS_YEL, 0.0))
-    green_ceiling = np.minimum(green_ceiling, red_floor)
-
-    return pd.DataFrame({
-        "target": t,
-        "target_int": target_ints.astype(int),
-        "green_cpa_limit": green_cpa_limit,
-        "deposit_break": deposit_break,
-        "green_ceiling": green_ceiling,
-        "red_floor": red_floor,
-        "yellow_soft_ceiling": yellow_soft,
-        "red_ceiling": red_ceiling,
-    }, index=E.index)
-
-
-def _compute_make_yellow_target(e: float, f_cur: float, k: float, thresholds_row: pd.Series) -> Optional[float]:
-    if e <= 0:
-        return None
-    red_ceiling = float(thresholds_row.get("red_ceiling", 0.0))
-    if red_ceiling <= f_cur + EPS:
-        return None
-
-    candidates: List[float] = []
-
-    cpa_cross = float(thresholds_row.get("green_cpa_limit", 0.0))
-    if np.isfinite(cpa_cross) and cpa_cross > f_cur + EPS:
-        candidates.append(min(red_ceiling, cpa_cross + EPS_YEL))
-
-    deposit_break = float(thresholds_row.get("deposit_break", 0.0))
-    if np.isfinite(deposit_break) and deposit_break > f_cur + EPS:
-        candidate_raw = deposit_break + EPS_YEL
-        if _calc_cpa(e, candidate_raw) < float(thresholds_row.get("target_int", CPA_TARGET_INT)) + EPS:
-            candidates.append(min(red_ceiling, candidate_raw))
-
-    if not candidates:
-        return None
-
-    yellow_soft = float(thresholds_row.get("yellow_soft_ceiling", 0.0))
-    if yellow_soft > 0:
-        candidates = [min(c, yellow_soft) for c in candidates]
-
-    red_floor = float(thresholds_row.get("red_floor", 0.0))
-    if red_floor > 0:
-        candidates = [min(c, red_floor) for c in candidates]
-
-    target_value = min(candidates)
-    return target_value if target_value > f_cur + EPS else None
-
-
-def _compute_yellow_limit(e: float, f_cur: float, k: float, thresholds_row: pd.Series) -> float:
-    red_ceiling = float(thresholds_row.get("red_ceiling", 0.0))
-    if red_ceiling <= 0:
-        return 0.0
-    deposit_now = _calc_deposit_pct(k, f_cur)
-    if deposit_now > DEPOSIT_GREEN_MIN + EPS:
-        limit = float(thresholds_row.get("yellow_soft_ceiling", 0.0))
-    else:
-        limit = max(0.0, float(thresholds_row.get("green_cpa_limit", 0.0)) - EPS_YEL)
-
-    red_floor = float(thresholds_row.get("red_floor", 0.0))
-    if red_floor > 0:
-        limit = min(limit, red_floor)
-
-    return min(max(limit, 0.0), red_ceiling)
-
-
-def _classify_status(E: float, F: float, K: float, target: Optional[float] = None) -> str:
+def _classify_status(E: float, F: float, K: float) -> str:
     if E <= 0:
         return "Grey"
-    target_val, target_int = _resolve_target_value(target)
-    cpa = _calc_cpa(E, F)
-    deposit_pct = _calc_deposit_pct(K, F)
+    H = 1.3 * F / E if E else float("inf")
+    L = (100.0 * K) / (1.3 * F) if F else float("inf")
 
-    deposit_green_cutoff = DEPOSIT_GREEN_MIN + DEPOSIT_TOL
-    red_lower_bound = target_val * YELLOW_MULT
-    red_upper_bound = target_val * RED_MULT
-
-    if (deposit_pct > deposit_green_cutoff) and (cpa <= target_int + CPA_TOL):
+    # Green: E>0 and H<=9 and L>39.99
+    green = (H <= H_THRESH + EPS) and (L > L_THRESH + EPS)
+    if green:
         return "Green"
 
-    if deposit_pct > deposit_green_cutoff:
-        if (cpa >= target_int - CPA_TOL) and (cpa < red_lower_bound - CPA_TOL):
-            return "Yellow"
-    else:
-        if cpa <= target_int - CPA_TOL:
-            return "Yellow"
-
-    if (cpa >= red_lower_bound - CPA_TOL) and (cpa <= red_upper_bound + CPA_TOL):
-        return "Red"
-
-    return "Grey"
+    # Yellow: E>0 and ((H<=9) or (L>39.99)) and not Green
+    yellow = (H <= H_THRESH + EPS) or (L > L_THRESH + EPS)
+    return "Yellow" if yellow else "Red"  # Red: H>9 and L<=39.99
 
 
 def _fmt(v: float, suf: str = "", nan_text: str = "-") -> str:
@@ -784,9 +764,7 @@ def _fmt(v: float, suf: str = "", nan_text: str = "-") -> str:
 def build_allocation_explanation(df_source: pd.DataFrame,
                                  alloc_vec: pd.Series,
                                  budget: float,
-                                 max_lines: int = 20,
-                                 *,
-                                 alloc_is_delta: bool = True) -> str:
+                                 max_lines: int = 20) -> str:
     """
     Створює текстовий звіт:
       - скільки бюджету використано і залишок
@@ -805,33 +783,19 @@ def build_allocation_explanation(df_source: pd.DataFrame,
     name = df.get("Назва Офферу", pd.Series([""] * len(df)))
     geo = df.get("ГЕО", pd.Series([""] * len(df)))
     E = pd.to_numeric(df.get("FTD qty", 0), errors="coerce").fillna(0.0)
-    F = _normalize_money(df.get("Total spend", pd.Series(0.0, index=df.index))).fillna(0.0)
-    K = _normalize_money(df.get("Total Dep Amount", pd.Series(0.0, index=df.index))).fillna(0.0)
-    targets, _ = _extract_targets(df)
+    F = pd.to_numeric(df.get("Total spend", 0), errors="coerce").fillna(0.0)
+    K = pd.to_numeric(df.get("Total Dep Amount", 0), errors="coerce").fillna(0.0)
 
-    alloc_input = pd.to_numeric(alloc_vec, errors="coerce").reindex(df.index).fillna(0.0)
-
-    if alloc_is_delta:
-        alloc_delta = alloc_input
-        F_new = F + alloc_delta
-        used = float(alloc_delta.sum())
-    else:
-        F_new = alloc_input
-        alloc_delta = F_new - F
-        used = float(F_new.sum())
+    alloc = pd.to_numeric(alloc_vec, errors="coerce").reindex(df.index).fillna(0.0)
+    F_new = (F + alloc)
 
     # Статуси ДО/ПІСЛЯ
-    before = [
-        _classify_status(float(E[i]), float(F[i]), float(K[i]), float(targets.at[i]))
-        for i in df.index
-    ]
-    after = [
-        _classify_status(float(E[i]), float(F_new[i]), float(K[i]), float(targets.at[i]))
-        for i in df.index
-    ]
+    before = [_classify_status(float(E[i]), float(F[i]), float(K[i])) for i in df.index]
+    after = [_classify_status(float(E[i]), float(F_new[i]), float(K[i])) for i in df.index]
 
     # Метрики
     total_budget = float(budget)
+    used = float(alloc.sum())
     left = max(0.0, total_budget - used)
 
     yellow_before = sum(1 for s in before if s == "Yellow")
@@ -840,8 +804,8 @@ def build_allocation_explanation(df_source: pd.DataFrame,
 
     # Побудова списку рядків з алокацією
     rows = []
-    for i in alloc_delta.index:
-        if alloc_delta[i] <= 0:
+    for i in alloc.index:
+        if alloc[i] <= 0:
             continue
 
         Ei = float(E[i]);
@@ -859,174 +823,336 @@ def build_allocation_explanation(df_source: pd.DataFrame,
 
         line = (
             f"- {str(offer[i]) or ''} / {str(name[i]) or ''} / {str(geo[i]) or ''}: "
-            f"+{alloc_delta[i]:.2f} → Total Spend {Fi:.2f}→{Fni:.2f}; "
+            f"+{alloc[i]:.2f} → Total Spend {Fi:.2f}→{Fni:.2f}; "
             f"CPA {_fmt(H_before)}→{_fmt(H_after)}, "
             f"My deposit amount {_fmt(L_before, '%')}→{_fmt(L_after, '%')} | "
             f"{before[i]} → {after[i]}"
         )
-        rows.append((alloc_delta[i], line))
+        rows.append((alloc[i], line))
 
     # Сортуємо за найбільшою алокацією і обрізаємо
     rows.sort(key=lambda x: (-x[0], x[1]))
     detail_lines = [ln for _, ln in rows[:max_lines]]
-    escaped_detail_lines = [html.escape(ln) for ln in detail_lines]
 
     header = (
         f"Розподіл бюджету: {used:.2f} / {total_budget:.2f} використано; залишок {left:.2f}\n"
-        f"Жовтих ДО/ПІСЛЯ: {yellow_before} → {yellow_after} (зел.→жовт.: {green_to_yellow})\n"
-        f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — або депозит>{DEPOSIT_GREEN_MIN:.0f}% із CPA в діапазоні [INT(target); target×{YELLOW_MULT:.2f}),"
-        f" або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target); red — CPA в межах [target×{YELLOW_MULT:.2f}; target×{RED_MULT:.1f}]."
+        f"Жовтих ДО/ПІСЛЯ: {yellow_before} → {yellow_after} (зел.→жовт.: {green_to_yellow})"
     )
-
-    header = html.escape(header)
 
     if not detail_lines:
         return header + "\n\n(Алокації по рядках відсутні — бюджет не було куди розподілити за правилами.)"
 
-    return header + "\n\nТоп розподілів:\n" + "\n".join(escaped_detail_lines) + \
+    return header + "\n\nТоп розподілів:\n" + "\n".join(detail_lines) + \
         ("\n\n…Список обрізано." if len(rows) > max_lines else "")
 
 
-def compute_allocation_max_yellow(df: pd.DataFrame) -> Tuple[pd.DataFrame, float, pd.Series]:
+def allocate_with_openai(df: pd.DataFrame, rules_text: str, model: str | None = None) -> pd.DataFrame:
     """
-    Режим «максимум жовтих» з автоматичним бюджетом:
-      - кожен рядок має цільовий spend у колонці "Total+%" (верхня межа);
-      - доступний глобальний бюджет = вся поточна сума в колонці "Total spend";
-      - розподіл іде за зростанням Target: спершу переводимо green у yellow,
-        потім (якщо лишилися кошти) насичуємо жовті в межах CPA < target×YELLOW_MULT
-        та не виходячи за межі [target×YELLOW_MULT; target×RED_MULT], а за наявності
-        залишку доводимо рядки до червоного порогу (red_ceiling), де CPA в діапазоні
-        [target×YELLOW_MULT; target×RED_MULT] відповідає червоній зоні.
-    Повертає оновлену таблицю, фактично розподілений бюджет та фінальні значення spend по рядках.
+    Надсилає таблицю і правила в OpenAI, отримує назад оновлену таблицю.
+    Модель має ПОВЕРНУТИ CSV з тими ж колонками + колонка NEW SPEND (або оновити target-колонку).
+    """
+    if df.empty:
+        raise ValueError("Пуста таблиця для алокації.")
+
+    model = model or OPENAI_MODEL
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    # 1) Ділимо великий DF на чанки
+    chunks = _split_df_by_size(df)
+
+    updated_chunks: list[pd.DataFrame] = []
+
+    for idx, chunk in enumerate(chunks, start=1):
+        csv_in = _df_to_csv(chunk)
+
+        system_msg = (
+            "You are a meticulous data allocator. "
+            "Follow the given allocation rules exactly. "
+            "Return ONLY a CSV table with the SAME columns as input, "
+            f"and include a numeric column '{OPENAI_OUTPUT_COLUMN}' with the recomputed spend per row. "
+            "Do not add extra commentary. Use dot as decimal separator."
+        )
+
+        user_msg = (
+            "Rules:\n"
+            f"{rules_text}\n\n"
+            "Instructions:\n"
+            f"- Input table is a CSV.\n"
+            f"- Keep all original columns unchanged.\n"
+            f"- Add or overwrite a column named '{OPENAI_OUTPUT_COLUMN}' with the new per-row allocation (number only).\n"
+            "- Return ONLY the CSV (no explanations).\n\n"
+            "Input CSV:\n"
+            f"{csv_in}"
+        )
+
+        resp = client.chat.completions.create(
+            model=model,
+            temperature=0.0,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+        )
+
+        content = resp.choices[0].message.content or ""
+        csv_out = _csv_from_text(content)
+
+        # читаємо назад у DF
+        try:
+            out_df = pd.read_csv(io.StringIO(csv_out))
+        except Exception as e:
+            raise RuntimeError(f"Не вдалося розпарсити CSV від моделі на чанку {idx}: {e}")
+
+        # базова валідація
+        missing_cols = [c for c in chunk.columns if c not in out_df.columns]
+        if missing_cols:
+            raise RuntimeError(f"Модель не повернула всі колонки (чанк {idx}). Відсутні: {missing_cols}")
+
+        if OPENAI_OUTPUT_COLUMN not in out_df.columns:
+            raise RuntimeError(f"Модель не повернула колонку '{OPENAI_OUTPUT_COLUMN}' (чанк {idx}).")
+
+        # Зберігаємо порядок рядків: приєднаємо по індексу
+        # (очікується той самий порядок — але на всякий випадок приведемо довжини)
+        if len(out_df) != len(chunk):
+            # як fallback — підрізаємо/доповнювати не будемо; вважаємо помилкою
+            raise RuntimeError(
+                f"Розмір чанка змінився (очікував {len(chunk)}, отримав {len(out_df)}) на чанку {idx}."
+            )
+
+        # беремо тільки колонку з новими значеннями і змерджимо
+        chunk[OPENAI_OUTPUT_COLUMN] = out_df[OPENAI_OUTPUT_COLUMN].values
+        updated_chunks.append(chunk)
+
+    # збираємо назад
+    result = pd.concat(updated_chunks, axis=0)
+    result.reset_index(drop=True, inplace=True)
+    return result
+
+
+def allocate_total_spend_alternative(
+        df: pd.DataFrame,
+        *,
+        col_total_spend: str = "Total spend",      # F
+        col_ftd_qty: str = "FTD qty",              # E
+        col_cpa_target: str = "CPA Target",        # I
+        col_my_deposit: str = "My deposit amount", # L (перезаписуємо формулою)
+        col_total_dep_amount: str = "Total Dep Amount",  # K
+        col_geo: str = "ГЕО",
+        in_place: bool = False,
+        round_decimals: Optional[int] = 2,
+        excel_path: Optional[str] = None,
+        sheet_name: str = "Result",
+        header_row: int = 1,  # шапка в першому рядку
+) -> pd.DataFrame:
+    """
+    Pass#1: роздаємо під "жовтий" множник (за L із вхідного df).
+    Після Pass#1: перераховуємо L = (K / (F*1.3)) * 100, знаходимо рядки з L>THR,
+      де THR = 59 для Габону і 39 для інших,
+      рахуємо дві межі для F:
+        F_cap_deposit = (K/THR*100) * (100/130)
+        F_cap_cpa     = (E*I*1.3) * (100/130)
+      target_F = min(двох меж).
+      Якщо F < target_F — піднімаємо F у межах доступного бюджету.
+      Якщо F > target_F — зменшуємо F і повертаємо різницю в бюджет.
+    Pass#2: якщо ще є бюджет — піднімаємо F до "червоної" стелі: F_red = (E*I*1.8)*(100/130)
     """
 
-    dfw = df.copy()
-    dfw.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in dfw.columns]
+    work = df if in_place else df.copy()
 
-    E = pd.to_numeric(dfw.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
-    F_original = _normalize_money(
-        dfw.get("Total spend", pd.Series(0.0, index=dfw.index))
-    ).fillna(0.0)
-    K = _normalize_money(dfw.get("Total Dep Amount", pd.Series(0.0, index=dfw.index))).fillna(0.0)
-    T = pd.to_numeric(dfw.get("Total+%", 0.0), errors="coerce").fillna(0.0)
-    targets, target_ints = _extract_targets(dfw)
-    thresholds = _build_threshold_table(E, K, targets, target_ints)
+    # Перевірка колонок
+    for c in (col_total_spend, col_ftd_qty, col_cpa_target, col_my_deposit, col_total_dep_amount):
+        if c not in work.columns:
+            raise KeyError(f"Відсутня колонка: {c}")
+    if col_geo not in work.columns:
+        raise KeyError(f"Відсутня колонка з ГЕО: {col_geo}")
 
-    stop_before_red = thresholds["red_ceiling"].fillna(0.0)
+    # Приведення типів
+    for c in (col_total_spend, col_ftd_qty, col_cpa_target, col_my_deposit, col_total_dep_amount):
+        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0.0)
 
-    row_allowance = pd.Series(
-        np.minimum(T.to_numpy(), stop_before_red.to_numpy()),
-        index=dfw.index,
-    )
-    row_allowance = pd.to_numeric(row_allowance, errors="coerce").clip(lower=0.0).fillna(0.0)
+    # Нормалізоване ГЕО і поріг L: 59 для Габону, 39 для інших
+    geo_norm = work[col_geo].astype(str).str.strip().fillna("")
+    L_threshold_series = np.where(geo_norm.eq("Габон"), 59.0, 39.0)
 
-    available_budget = float(F_original.sum())
+    # Кліпи
+    work[col_ftd_qty] = work[col_ftd_qty].clip(lower=0)
+    work[col_cpa_target] = work[col_cpa_target].clip(lower=0)
+    work[col_my_deposit] = work[col_my_deposit].clip(lower=0)
+    work[col_total_dep_amount] = work[col_total_dep_amount].clip(lower=0)
 
-    partner_series = dfw.get(
-        "Partner",
-        dfw.get("Offer ID", dfw.get("Назва Офферу", pd.Series([""] * len(dfw), index=dfw.index))),
-    )
-    partner_series = partner_series.fillna("").astype(str)
-    geo_series = dfw.get("ГЕО", pd.Series([""] * len(dfw), index=dfw.index)).fillna("").astype(str)
+    mask_take = work[col_ftd_qty] > 0
 
-    order_df = pd.DataFrame(
-        {
-            "original_spend": F_original,
-            "partner": partner_series,
-            "geo": geo_series,
-            "__pos": np.arange(len(dfw), dtype=int),
-        },
-        index=dfw.index,
-    )
-    spend_order = (
-        order_df.sort_values(
-            by=["original_spend", "partner", "geo", "__pos"],
-            ascending=[True, True, True, True],
-            kind="mergesort",
-        ).index.tolist()
-    )
+    # Бюджет = сума старих F по E>0
+    budget = float(work.loc[mask_take, col_total_spend].sum())
+    if budget < 0:
+        budget = 0.0
+    print("Initial budget:", budget)
 
-    alloc = pd.Series(0.0, index=dfw.index, dtype=float)
-    rem = available_budget
+    # Обнуляємо F
+    work[col_total_spend] = 0.0
 
-    yellow_caps = thresholds["yellow_soft_ceiling"].fillna(0.0).clip(lower=0.0)
-    red_caps = thresholds["red_ceiling"].fillna(0.0).clip(lower=0.0)
+    # Коефіцієнти
+    CONV = 100.0 / 130.0  # == 1/1.3
+    MULT_Y_HIGH = 1.3     # для L>=THR у Pass#1
+    MULT_Y_LOW  = 1.1     # для L<THR  у Pass#1
+    MULT_CPA_Y  = 1.3     # "жовта" CPA межа
+    MULT_RED    = 1.8     # "червона" стеля для Pass#2
 
-    for idx in spend_order:
-        if rem <= 1e-9:
+    # Використаємо L із ВХІДНОГО df для вибору множника в Pass#1
+    L_for_threshold = pd.to_numeric(df[col_my_deposit], errors="coerce").fillna(0.0).clip(lower=0)
+
+    # -------- Pass#1: до "жовтого" --------
+    idx_pass1 = work.loc[mask_take].sort_values(by=col_ftd_qty, ascending=True).index
+
+    for i in idx_pass1:
+        if budget <= 0:
             break
-        if float(E.at[idx]) <= 0:
-            continue
-        cap = min(float(yellow_caps.at[idx]), float(row_allowance.at[idx]))
-        cap = max(cap, 0.0)
-        need = cap - float(alloc.at[idx])
-        if need <= 1e-9:
-            continue
-        give = min(rem, need)
-        if give <= 1e-9:
-            continue
-        alloc.at[idx] += give
-        rem -= give
+        E = float(work.at[i, col_ftd_qty])
+        I = float(work.at[i, col_cpa_target])
+        Lthr_val = float(L_for_threshold.at[i])
+        thr_i = float(L_threshold_series[work.index.get_loc(i)])  # 59 для Габону, 39 інакше
 
-    if rem > 1e-9:
-        for idx in spend_order:
-            if rem <= 1e-9:
+        mult = MULT_Y_HIGH if Lthr_val >= thr_i else MULT_Y_LOW
+        target_F = E * I * mult * CONV  # == (E * I * mult)/1.3
+
+        alloc = min(target_F, budget)
+        work.at[i, col_total_spend] = alloc
+        budget -= alloc
+
+    # -------- Перерахунок L та "підняття/зменшення" F для L>THR --------
+    # L_now = (K / (F*1.3)) * 100
+    G_now = work[col_total_spend] * 1.3
+    with np.errstate(divide='ignore', invalid='ignore'):
+        L_now = np.where(G_now > 0, (work[col_total_dep_amount] / G_now) * 100.0, np.inf)
+    work[col_my_deposit] = L_now  # записати для наглядності
+
+    # Маска коригування: E>0 і L_now > THR(geo)
+    mask_adjust = mask_take.values & (L_now > L_threshold_series)
+
+    if mask_adjust.any():
+        # Депозитна верхня межа: F_cap_dep = (K/THR*100) * CONV
+        F_cap_dep = (work[col_total_dep_amount].values / L_threshold_series * 100.0) * CONV
+        # CPA межа: F_cap_cpa = (E * I * 1.3) * CONV
+        F_cap_cpa = (work[col_ftd_qty].values * work[col_cpa_target].values * MULT_CPA_Y) * CONV
+
+        # Цільовий F — мінімум двох верхніх меж
+        F_target = np.minimum(F_cap_dep, F_cap_cpa)
+
+        curF = work[col_total_spend].values
+        tgtF = F_target
+        adj  = mask_adjust
+
+        delta = np.zeros_like(curF, dtype=float)
+
+        # Потрібно підняти (consume budget)
+        need_up_mask = adj & (tgtF > curF)
+        delta_up = tgtF - curF
+        need_up_total = float(delta_up[need_up_mask].sum())
+
+        if need_up_total > 0 and budget > 0:
+            # Якщо бюджету мало — піднімаємо пропорційно
+            ratio = min(1.0, budget / need_up_total)
+            inc = np.zeros_like(curF, dtype=float)
+            inc[need_up_mask] = delta_up[need_up_mask] * ratio
+            curF += inc
+            budget -= float(inc.sum())
+
+        # Потрібно зменшити (free budget)
+        need_down_mask = adj & (tgtF < curF)
+        freed = float((curF[need_down_mask] - tgtF[need_down_mask]).sum())
+        if freed > 0:
+            curF[need_down_mask] = tgtF[need_down_mask]
+            budget += freed
+
+        work[col_total_spend] = curF
+        print(f"[Adjust L>THR] budget after adjust: {budget:.2f}")
+
+        # Оновимо L після зміни F (щоб бачити актуальні значення)
+        G_now = work[col_total_spend] * 1.3
+        with np.errstate(divide='ignore', invalid='ignore'):
+            L_now = np.where(G_now > 0, (work[col_total_dep_amount] / G_now) * 100.0, np.inf)
+        work[col_my_deposit] = L_now
+
+    # -------- Pass#2: до "червоної" стелі --------
+    if budget > 0:
+        idx_pass2 = work.loc[mask_take].sort_values(by=col_total_spend, ascending=True).index
+        for i in idx_pass2:
+            if budget <= 0:
                 break
-            if float(E.at[idx]) <= 0:
+            E = float(work.at[i, col_ftd_qty])
+            I = float(work.at[i, col_cpa_target])
+
+            red_cap = E * I * MULT_RED * CONV  # верхня межа F
+            cur_F = float(work.at[i, col_total_spend])
+
+            need = max(0.0, red_cap - cur_F)
+            if need <= 0:
                 continue
-            cap = min(float(red_caps.at[idx]), float(row_allowance.at[idx]))
-            cap = max(cap, 0.0)
-            need = cap - float(alloc.at[idx])
-            if need <= 1e-9:
-                continue
-            give = min(rem, need)
-            if give <= 1e-9:
-                continue
-            alloc.at[idx] += give
-            rem -= give
 
-    F_final = alloc
-    statuses_final = pd.Series([
-        _classify_status(float(E.at[i]), float(F_final.at[i]), float(K.at[i]), float(targets.at[i]))
-        for i in dfw.index
-    ], index=dfw.index)
+            add = min(need, budget)
+            work.at[i, col_total_spend] = cur_F + add
+            budget -= add
 
-    dfw["Total spend"] = F_final
-    dfw["Allocated extra"] = F_final
-    dfw["New Total spend"] = F_final
-    dfw["Will be yellow"] = ["Yes" if statuses_final.at[i] == "Yellow" else "No" for i in dfw.index]
+    # Округлення
+    if round_decimals is not None:
+        work[col_total_spend] = work[col_total_spend].round(round_decimals)
 
-    used = float(F_final.sum())
+    if excel_path:
+        # Запис у файл/аркуш
+        with ExcelWriter(excel_path, engine="openpyxl", mode="w") as writer:
+            work.to_excel(writer, sheet_name=sheet_name, index=False)
+            ws = writer.book[sheet_name]
+            first_data_row = header_row + 1
+            last_data_row = header_row + len(work)
+            inject_formulas_and_cf(
+                ws,
+                header_row=header_row,
+                first_data_row=first_data_row,
+                last_data_row=last_data_row,
+            )
+            writer._save()
 
-    return dfw, used, alloc
+    return work
 
 
 def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.DataFrame, str, pd.Series]:
     """
-    Алгоритм нового розподілу:
-      A) Мінімально переводимо GREEN → YELLOW (рухаємо CPA до INT(target) або депозит до 39%, не перетинаючи червону межу).
-      B) Якщо залишився бюджет — насичуємо жовті, але тримаємося в межах CPA < target×YELLOW_MULT та не заходимо у червону зону [target×YELLOW_MULT; target×RED_MULT] (ця зона → Red).
+    Нова послідовність:
+      A) Спочатку намагаємось мінімально перевести GREEN -> YELLOW (дотримуючись CPA<=CPA_CAP).
+      B) Якщо залишився бюджет — насичуємо YELLOW максимально, але так, щоб вони залишались YELLOW (і CPA<=CPA_CAP).
 
     Позначення:
-      E = FTD qty,
-      F = Total spend,
-      K = Total Dep Amount.
+      E = FTD qty
+      F = Total spend
+      K = Total Dep Amount
+
+    Межі/похідні:
+      F_at_H = H_THRESH * E / 1.3
+      F_at_L = (100 * K) / (1.3 * L_THRESH)  # L == L_THRESH при такому F
+      F_cap  = CPA_CAP * E / 1.3
     """
     dfw = df.copy()
 
     # Числові колонки
     E = pd.to_numeric(dfw["FTD qty"], errors="coerce").fillna(0.0)
-    F = _normalize_money(dfw.get("Total spend", pd.Series(0.0, index=dfw.index))).fillna(0.0)
-    K = _normalize_money(dfw.get("Total Dep Amount", pd.Series(0.0, index=dfw.index))).fillna(0.0)
-    targets, target_ints = _extract_targets(dfw)
-    thresholds = _build_threshold_table(E, K, targets, target_ints)
+    F = pd.to_numeric(dfw["Total spend"], errors="coerce").fillna(0.0)
+    K = pd.to_numeric(dfw["Total Dep Amount"], errors="coerce").fillna(0.0)
 
-    statuses_now = pd.Series([
-        _classify_status(float(E.at[i]), float(F.at[i]), float(K.at[i]), float(targets.at[i]))
-        for i in dfw.index
-    ], index=dfw.index)
+    # Поточні H, L
+    with np.errstate(divide='ignore', invalid='ignore'):
+        H = 1.3 * F / E.replace(0, np.nan)
+        L = 100.0 * K / (1.3 * F.replace(0, np.nan))
 
-    green_mask = statuses_now == "Green"
+    # Межі
+    F_at_H = H_THRESH * E / 1.3
+    F_at_L = (100.0 * K) / (1.3 * L_THRESH)
+    F_cap = CPA_CAP * E / 1.3
+
+    # Маски статусів (строго відповідно до правил/Excel)
+    grey_mask = (E <= 0)
+    green_mask = (~grey_mask) & (H <= H_THRESH + EPS) & (L > L_THRESH + EPS)
+    yellow_mask = (~grey_mask) & ((H <= H_THRESH + EPS) | (L > L_THRESH + EPS)) & (~green_mask)
+    # red_mask   = (~grey_mask) & (~green_mask) & (~yellow_mask)  # не потрібен явно
 
     alloc = pd.Series(0.0, index=dfw.index, dtype=float)
     rem = float(budget) if budget and budget > 0 else 0.0
@@ -1034,87 +1160,119 @@ def compute_optimal_allocation(df: pd.DataFrame, budget: float) -> Tuple[pd.Data
     # -------------------------------
     # A) GREEN -> YELLOW (мінімальний spend)
     # -------------------------------
-    make_yellow_targets = pd.Series(np.nan, index=dfw.index)
-    for idx in dfw.index:
-        if not green_mask.at[idx]:
-            continue
-        goal = _compute_make_yellow_target(float(E.at[idx]), float(F.at[idx]), float(K.at[idx]), thresholds.loc[idx])
-        if goal is not None:
-            make_yellow_targets.at[idx] = goal
+    # Кандидати цільових F:
+    #   - перетнути межу H: F_cross_H = F_at_H + EPS_YEL (робить H трохи > H_THRESH)
+    #   - перетнути межу L: F_cross_L = F_at_L + EPS_YEL (робить L трохи < L_THRESH)
+    F_cross_H = F_at_H + EPS_YEL
+    F_cross_L = F_at_L + EPS_YEL
 
-    need_delta = (make_yellow_targets - F).clip(lower=0.0)
+    # Мінімальний F, який зламав "зеленість", але не робить рядок "червоним" і не перевищує CPA cap.
+    candidates = pd.DataFrame({
+        "F_now": F,
+        "F_cap": F_cap,
+        "F_cross_H": F_cross_H,
+        "F_cross_L": F_cross_L,
+        "E": E,
+        "K": K
+    })
 
-    for idx in need_delta[green_mask].sort_values(ascending=True).index:
+    # Для кожного green обчислюємо найменшу допустиму ціль F_target
+    F_target = F.copy()
+
+    for i in candidates[green_mask].index:
+        Fi = float(candidates.at[i, "F_now"])
+        Fcap = float(candidates.at[i, "F_cap"])
+        Fh = float(candidates.at[i, "F_cross_H"])
+        Fl = float(candidates.at[i, "F_cross_L"])
+        Ei = float(E.at[i])
+        Ki = float(K.at[i])
+
+        # Обидва потенційні цілі в межах CPA?
+        options = []
+        for Ft in (Fh, Fl):
+            if np.isfinite(Ft) and Ft > Fi + EPS and Ft <= Fcap + EPS:
+                # Перевіримо, що Ft не робить рядок "червоним"
+                Ht = 1.3 * Ft / Ei if Ei > 0 else float("inf")
+                Lt = (100.0 * Ki) / (1.3 * Ft) if Ft > 0 else float("inf")
+                is_red = (Ht > H_THRESH + EPS) and (Lt <= L_THRESH + EPS)
+                if not is_red:
+                    options.append(Ft)
+
+        if options:
+            F_target.at[i] = min(options)  # найменша ціна переходу
+        else:
+            # неможливо легально зробити жовтим — залишаємо як є
+            F_target.at[i] = Fi
+
+    need_delta = (F_target - F).clip(lower=0.0)
+
+    # Розподіл: за зростанням потрібної дельти
+    for i in need_delta[green_mask].sort_values(ascending=True).index:
         if rem <= 1e-9:
             break
-        need = float(need_delta.at[idx])
+        need = float(need_delta.at[i])
         if need <= 0:
             continue
         take = min(rem, need)
-        if take <= 0:
-            continue
-        alloc.at[idx] += take
+        alloc.at[i] += take
         rem -= take
 
     # -------------------------------
-    # B) Насичення YELLOW в межах правил (залишитись жовтими)
+    # B) Насичення YELLOW, щоб лишались YELLOW (CPA<=cap)
     # -------------------------------
     if rem > 1e-9:
+        # Перерахувати F після кроку A
         F_mid = F + alloc
-        status_mid = pd.Series([
-            _classify_status(float(E.at[i]), float(F_mid.at[i]), float(K.at[i]), float(targets.at[i]))
-            for i in dfw.index
-        ], index=dfw.index)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            H_mid = 1.3 * F_mid / E.replace(0, np.nan)
+            L_mid = 100.0 * K / (1.3 * F_mid.replace(0, np.nan))
 
-        yellow_limit = pd.Series(0.0, index=dfw.index, dtype=float)
-        for idx in dfw.index:
-            if status_mid.at[idx] != "Yellow":
-                continue
-            limit_val = _compute_yellow_limit(float(E.at[idx]), float(F_mid.at[idx]), float(K.at[idx]), thresholds.loc[idx])
-            yellow_limit.at[idx] = max(limit_val, float(F_mid.at[idx]))
+        # Ті, хто зараз жовті (включно з новими з кроку A)
+        is_green_mid = (~(E <= 0)) & (H_mid <= H_THRESH + EPS) & (L_mid > L_THRESH + EPS)
+        is_yellow_mid = (~(E <= 0)) & (((H_mid <= H_THRESH + EPS) | (L_mid > L_THRESH + EPS)) & (~is_green_mid))
 
-        headroom = (yellow_limit - F_mid).clip(lower=0.0)
+        # Межа "залишитись жовтим": до max(F_at_H, F_at_L - EPS_YEL), та ще й не перевищити cap
+        F_yellow_limit_base = pd.Series(np.maximum(F_at_H, F_at_L - EPS_YEL), index=dfw.index)
+        F_yellow_limit_final = pd.Series(np.minimum(F_yellow_limit_base, F_cap), index=dfw.index).fillna(0.0)
 
-        for idx in headroom.sort_values(ascending=False).index:
+        headroom = (F_yellow_limit_final - F_mid).clip(lower=0.0)
+
+        # Greedy за спаданням headroom
+        for i in headroom[is_yellow_mid].sort_values(ascending=False).index:
             if rem <= 1e-9:
                 break
-            head = float(headroom.at[idx])
-            if head <= 1e-9:
+            give = float(min(rem, headroom.at[i]))
+            if give <= 0:
                 continue
-            give = min(rem, head)
-            if give <= 1e-9:
-                continue
-            alloc.at[idx] += give
+            alloc.at[i] += give
             rem -= give
 
     # ПІДСУМОК
     F_final = F + alloc
-    statuses_final = pd.Series([
-        _classify_status(float(E.at[i]), float(F_final.at[i]), float(K.at[i]), float(targets.at[i]))
-        for i in dfw.index
-    ], index=dfw.index)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        H_final = 1.3 * F_final / E.replace(0, np.nan)
+        L_final = 100.0 * K / (1.3 * F_final.replace(0, np.nan))
 
-    kept_yellow = int((statuses_final == "Yellow").sum())
+    still_green = (E > 0) & (H_final <= H_THRESH + EPS) & (L_final > L_THRESH + EPS)
+    still_yellow = (E > 0) & (((H_final <= H_THRESH + EPS) | (L_final > L_THRESH + EPS)) & (~still_green))
+
+    kept_yellow = int(still_yellow.sum())
     total_posE = int((E > 0).sum())
 
     dfw["Allocated extra"] = alloc
     dfw["New Total spend"] = F_final
-    dfw["Will be yellow"] = ["Yes" if statuses_final.at[i] == "Yellow" else "No" for i in dfw.index]
+    dfw["Will be yellow"] = ["Yes" if x else "No" for x in still_yellow]
 
-    summary = html.escape(
+    summary = (
         f"Бюджет: {budget:.2f}\n"
         f"Жовтих після розподілу: {kept_yellow}/{total_posE}\n"
-        f"Правила: green — CPA≤INT(target) і депозит>{DEPOSIT_GREEN_MIN:.0f}%, yellow — тримаємо CPA нижче target×{YELLOW_MULT:.2f} "
-        f"(або депозит≤{DEPOSIT_GREEN_MIN:.0f}% із CPA<INT(target)), red — CPA в межах [target×{YELLOW_MULT:.2f}; target×{RED_MULT:.1f}]."
+        f"Правила: спочатку переводимо зелені в жовті мінімальним spend (CPA≤{CPA_CAP:g}), "
+        f"потім насичуємо жовті в межах жовтого (H≤{H_THRESH:g} або L>{L_THRESH:.2f}, CPA≤{CPA_CAP:g})."
     )
     return dfw, summary, alloc
 
 
-def write_result_like_excel_with_new_spend(bio: io.BytesIO,
-                                           df_source: pd.DataFrame,
-                                           new_total_spend: pd.Series,
-                                           *,
-                                           overwrite_total_spend: bool = False):
+def write_result_like_excel_with_new_spend(bio: io.BytesIO, df_source: pd.DataFrame, new_total_spend: pd.Series):
     """
     Build an Excel sheet identical to result.xlsx structure:
     Columns (A..P):
@@ -1136,21 +1294,14 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
 
     # Coerce numbers
     df_out["FTD qty"] = pd.to_numeric(df_out.get("FTD qty", 0), errors="coerce").fillna(0)
-    df_out["Total spend"] = _normalize_money(
-        df_out.get("Total spend", pd.Series(0.0, index=df_out.index))
-    ).fillna(0.0)
-    df_out["Total Dep Amount"] = _normalize_money(
-        df_out.get("Total Dep Amount", pd.Series(0.0, index=df_out.index))
-    ).fillna(0.0)
+    df_out["Total spend"] = pd.to_numeric(df_out.get("Total spend", 0), errors="coerce").fillna(0.0)
+    df_out["Total Dep Amount"] = pd.to_numeric(df_out.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
 
     # Apply new spend
     # align by index; if shapes don't match, reindex new_total_spend to df_out
     new_total_spend = pd.to_numeric(new_total_spend, errors="coerce").fillna(0.0)
     new_total_spend = new_total_spend.reindex(df_out.index).fillna(0.0)
-    if overwrite_total_spend:
-        df_out["Total spend"] = new_total_spend.round(2)
-    else:
-        df_out["Total spend"] = (df_out["Total spend"] + new_total_spend).round(2)
+    df_out["Total spend"] = (df_out["Total spend"] + new_total_spend).round(2)
 
     # Ensure missing columns exist as blanks
     for col in final_cols:
@@ -1163,7 +1314,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
     # Round numeric display columns
     df_out["FTD qty"] = pd.to_numeric(df_out["FTD qty"], errors="coerce").fillna(0).astype(int)
     for col in ["Total spend", "Total Dep Amount"]:
-        df_out[col] = _normalize_money(df_out[col]).round(2)
+        df_out[col] = pd.to_numeric(df_out[col], errors="coerce").round(2)
 
     with pd.ExcelWriter(bio, engine="openpyxl") as writer:
         df_out.to_excel(writer, index=False, sheet_name="Result")
@@ -1180,7 +1331,7 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
         for r in range(first_row, last_row + 1):
             ws[f"G{r}"].value = f"=F{r}*1.3"  # Total+%
             ws[f"H{r}"].value = f"=IFERROR(G{r}/E{r},\"\")"  # CPA
-            ws[f"I{r}"].value = CPA_TARGET_DEFAULT  # CPA Target
+            ws[f"I{r}"].value = cpa_target_for_geo(ws[f"D{r}"].value)  # CPA Target
             ws[f"J{r}"].value = f"=IFERROR(K{r}/E{r},\"\")"  # СP/Ч
             ws[f"L{r}"].value = f"=IFERROR(K{r}/G{r}*100,0)"  # My deposit amount
             ws[f"M{r}"].value = f"=G{r}*0.4"  # Profit 40%
@@ -1205,28 +1356,42 @@ def write_result_like_excel_with_new_spend(bio: io.BytesIO,
             for r in range(first_row, last_row + 1):
                 ws[f"{col}{r}"].number_format = "0.00"
 
-        # Conditional formatting за новими правилами
+        # Conditional formatting — SAME rules/colors
         data_range = f"A{first_row}:P{last_row}"
         grey = PatternFill("solid", fgColor="BFBFBF")
         green = PatternFill("solid", fgColor="C6EFCE")
         yellow = PatternFill("solid", fgColor="FFEB9C")
         red = PatternFill("solid", fgColor="FFC7CE")
 
-        ws.conditional_formatting.add(data_range, FormulaRule(formula=["$E2=0"], fill=grey, stopIfTrue=True))
-        ws.conditional_formatting.add(data_range,
-                                      FormulaRule(formula=[f"AND($E2>0,$H2<=INT($I2),$L2>{DEPOSIT_GREEN_MIN:.0f})"], fill=green, stopIfTrue=True))
-        yellow_formula = _build_yellow_formula()
-        ws.conditional_formatting.add(data_range, FormulaRule(formula=[yellow_formula], fill=yellow,
-                                                              stopIfTrue=True))
+        THR2 = 'IF($D2="Габон",59,39)'
+
+        # Grey: E = 0
+        ws.conditional_formatting.add(
+            data_range,
+            FormulaRule(formula=["$E2=0"], fill=grey, stopIfTrue=True)
+        )
+
+        # Green: INT(H) <= INT(I) AND L > 39
+        ws.conditional_formatting.add(
+            data_range,
+            FormulaRule(formula=[f"AND($E2>0,INT($H2)<=INT($I2),$L2>{THR2})"], fill=green, stopIfTrue=True)
+        )
+
+        # Yellow: (INT(H) <= INT(I)) OR (L > 39 AND H < I*1.31)
+        ws.conditional_formatting.add(
+            data_range,
+            FormulaRule(formula=[f"AND($E2>0,OR(INT($H2)<=INT($I2),AND($L2>{THR2},$H2<$I2*1.31)))"], fill=yellow,
+                        stopIfTrue=True)
+        )
+
+        # Red: (E > 0 AND H > I*1.3 AND L > 39) OR (E > 0 AND INT(H) > INT(I) AND L < 39)
         ws.conditional_formatting.add(
             data_range,
             FormulaRule(
-                formula=[
-                    f"AND($E2>0,$H2>=$I2*{YELLOW_MULT:.2f},$H2<=$I2*{RED_MULT:.2f})"
-                ],
+                formula=[f"OR(AND($E2>0,$H2>$I2*1.3,$L2>{THR2}),AND($E2>0,INT($H2)>INT($I2),$L2<{THR2}))"],
                 fill=red,
-                stopIfTrue=True,
-            ),
+                stopIfTrue=True
+            )
         )
 
 
@@ -1241,13 +1406,13 @@ def start(message: types.Message):
         message,
         (
             "Привіт! 👋\n\n"
-            "1) Надішли <b>головну таблицю</b> (CSV/XLSX) — аркуш <b>BUDG</b> з колонками: <b>Назва Офферу</b>, <b>ГЕО</b>, <b>Загальні витрати</b>.\n"
-            "2) Бот підсумує витрати по унікальних парах <b>Offer ID+ГЕО</b> і визначить список унікальних <b>Назв Офферу</b>.\n"
-            "3) Потім НА КОЖНУ <b>Назву Офферу</b> надішли одну додаткову таблицю (в ній є всі країни для цього офера) з колонками: <b>Країна</b>, <b>Сума депозитів</b>.\n"
-            "4) Фінал: Excel з колонками: Назва Офферу, ГЕО, Total Spend, Total Dep Sum, Total Dep Amount.\n"
-            "Надішли зараз головну таблицю."
+            "1️⃣ Надішліть <b>головну таблицю</b> (CSV/XLSX) — аркуш <b>BUDG</b>.\n"
+            "2️⃣ У підписі до файлу (caption) вкажіть номер місяця, наприклад: <code>9</code>.\n\n"
+            "Бот відфільтрує дані по цьому місяцю."
         ),
+        parse_mode="HTML",
     )
+    user_states[chat_id].phase = "WAIT_MAIN"
 
 
 @bot.message_handler(content_types=["document"])
@@ -1261,148 +1426,134 @@ def on_document(message: types.Message):
         file_bytes = bot.download_file(file_info.file_path)
         filename = message.document.file_name or "uploaded"
     except Exception as e:
-        bot.reply_to(message, f"Не вдалося отримати файл: <code>{e}</code>")
+        bot.reply_to(message, f"Не вдалося отримати файл: <code>{e}</code>", parse_mode="HTML")
         return
 
     try:
         if state.phase == "WAIT_MAIN":
+            # Try to read month from caption
+            caption = message.caption or ""
+            try:
+                month = int(caption.strip())
+                if not 1 <= month <= 12:
+                    month = datetime.now().month
+            except ValueError:
+                month = datetime.now().month
+
+            df = load_main_budg_table(file_bytes, filename=filename, month=month)
+            bot.reply_to(message,
+                         f"✅ Головна таблиця завантажена (місяць: {month}). Тепер надішліть додаткові таблиці.")
+            handle_main_table(message, state, df)
+        if state.phase == "WAIT_MAIN":
             df = load_main_budg_table(file_bytes, filename=filename)
             bot.reply_to(message, "✅ Головна таблиця завантажена! Тепер надішліть додаткові таблиці.")
             handle_main_table(message, state, df)
+
         elif state.phase == "WAIT_ADDITIONAL":
             df = read_additional_table(file_bytes, filename)
             handle_additional_table(message, state, df)
-        elif state.phase == "WAIT_ALLOC_CHOICE":
-            bot.reply_to(message, "Спочатку оберіть режим розподілу за допомогою кнопок під повідомленням.")
-            return
+
         elif state.phase == "WAIT_ALLOC_RESULT":
-            if not state.alloc_mode:
-                bot.reply_to(
-                    message,
-                    "Режим розподілу не вибрано. Використай команду /allocate та обери потрібний режим.",
-                )
-                state.phase = "WAIT_MAIN"
-                state.alloc_df = None
-                state.alloc_mode = None
-                state.alloc_budget = None
-                return
+            # читаємо result.xlsx
+            bio = io.BytesIO(file_bytes)
             try:
-                df = read_result_allocation_table(file_bytes, filename)
-            except ValueError as ve:
-                bot.reply_to(
-                    message,
-                    (
-                        f"❌ Не вдалося опрацювати <b>{filename}</b>:\n"
-                        f"<code>{ve}</code>\n\n"
-                        "Будь ласка, переконайтеся, що надсилаєте згенерований ботом result.xlsx."
-                    ),
-                )
-                state.alloc_df = None
-                state.alloc_mode = None
-                state.alloc_budget = None
-                state.phase = "WAIT_MAIN"
+                df_res = pd.read_excel(bio, sheet_name="Result", engine="openpyxl")
+            except Exception:
+                bio.seek(0)
+                df_res = pd.read_excel(bio, engine="openpyxl")
+
+            # нормалізуємо назви
+            df_res.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in df_res.columns]
+
+            # мінімальний набір, від якого рахуємо
+            required_cols = ["FTD qty", "Total spend", "Total Dep Amount"]
+            missing = [c for c in required_cols if c not in df_res.columns]
+            if missing:
+                raise ValueError("У result.xlsx бракує колонок: " + ", ".join(missing))
+
+            # числа
+            for num_col in ["FTD qty", "Total spend", "Total Dep Amount"]:
+                df_res[num_col] = pd.to_numeric(df_res[num_col], errors="coerce").fillna(0)
+
+            # --- ГІЛКА ДЛЯ OpenAI: без бюджету ---
+            if getattr(state, "alloc_mode", None) == "openai":
+                try:
+                    base_rules = globals().get("OPENAI_RULES", """
+                        1) Обчисли колонку 'New Spend' для кожного рядка за правилами алокації:
+                           - Якщо FTD=0 — New Spend=0.
+                           - Жовтий поріг: FTD * CPA_target * 1.3 (якщо є відповідні поля).
+                           - Якщо доступні MyDeposit і Total+% — додаткове обмеження: MyDeposit * 100 / (Total+%).
+                           - Якщо після роздачі по жовтому лишається бюджет — дозалий до червоного порогу: FTD * CPA_target * 1.8 у порядку зростання Total+%.
+                        2) Не змінюй інші колонки. Поверни той самий набір колонок + 'New Spend'.
+                        3) Відповідь — ТІЛЬКИ CSV без пояснень. Десятковий роздільник — крапка.
+                    """).strip()
+
+                    # якщо хочеш, можеш передавати TOTAL_BUDGET тут теж — або взагалі не передавати
+                    rules_text = base_rules
+
+                    out_df = allocate_with_openai(df_res, rules_text)
+
+                    out = io.BytesIO()
+                    with pd.ExcelWriter(out, engine="xlsxwriter") as writer:
+                        out_df.to_excel(writer, index=False, sheet_name="Result")
+                    out.seek(0)
+
+                    bot.send_document(
+                        chat_id,
+                        out,
+                        visible_file_name="allocation_openai.xlsx",
+                        caption="Готово: алокація через OpenAI"
+                    )
+                except Exception as e:
+                    bot.send_message(chat_id, f"⚠️ Помилка алокації через OpenAI: <code>{e}</code>", parse_mode="HTML")
+                finally:
+                    state.phase = "WAIT_MAIN"
                 return
 
-            state.alloc_df = df
-            if state.alloc_mode == "budget":
-                state.phase = "WAIT_ALLOC_BUDGET"
-                bot.reply_to(message, "✅ Файл result.xlsx отримано. Введіть бюджет (наприклад: 200 або 200.5).")
-            elif state.alloc_mode == "max_yellow":
-                _alloc_df, used_budget, alloc_vec = compute_allocation_max_yellow(state.alloc_df)
-
-                total_spend = _normalize_money(
-                    state.alloc_df.get("Total spend", pd.Series(0.0, index=state.alloc_df.index))
-                ).fillna(0.0)
-                starting_budget = float(total_spend.sum())
-                unused_budget = max(0.0, starting_budget - used_budget)
-
-                df_norm = state.alloc_df.copy()
-                df_norm.columns = [str(c).replace("\xa0", " ").replace("\u00A0", " ").strip() for c in df_norm.columns]
-                E = pd.to_numeric(df_norm.get("FTD qty", 0.0), errors="coerce").fillna(0.0)
-                K = pd.to_numeric(df_norm.get("Total Dep Amount", 0.0), errors="coerce").fillna(0.0)
-                F_before = total_spend
-                F_after = pd.to_numeric(alloc_vec, errors="coerce").reindex(df_norm.index).fillna(0.0)
-
-                before_status = [_classify_status(float(E[i]), float(F_before[i]), float(K[i])) for i in df_norm.index]
-                after_status = [_classify_status(float(E[i]), float(F_after[i]), float(K[i])) for i in df_norm.index]
-
-                total_posE = int((E > 0).sum())
-                yellow_after = sum(1 for s in after_status if s == "Yellow")
-                green_to_yellow = sum(
-                    1 for i in range(len(before_status)) if before_status[i] == "Green" and after_status[i] == "Yellow"
+            # --- ЛОКАЛЬНІ режими: просимо бюджет ---
+            if state.alloc_mode == "alternative":
+                out_df = allocate_total_spend_alternative(
+                    df_res,
+                    col_total_spend="Total spend",
+                    col_ftd_qty="FTD qty",
+                    col_cpa_target="CPA Target",
+                    col_my_deposit="My deposit amount",
+                    col_total_dep_amount="Total Dep Amount",
+                    excel_path="Result.xlsx",  # файл з формулами + CF
+                    sheet_name="Result",
+                    header_row=1,
                 )
 
-                summary = (
-                    "Режим: максимум жовтих (Total+% цілі) з доведенням до red-ceiling.\n"
-                    f"Початковий бюджет (сума Total spend): {starting_budget:.2f}; розподілено: {used_budget:.2f}; невикористано: {unused_budget:.2f}\n"
-                    f"Жовтих після розподілу: {yellow_after}/{total_posE} (зел.→жовт.: {green_to_yellow})"
-                )
-
-                bio = io.BytesIO()
-                write_result_like_excel_with_new_spend(
-                    bio,
-                    state.alloc_df,
-                    new_total_spend=alloc_vec,
-                    overwrite_total_spend=True,
-                )
-
-                bio.seek(0)
-                bot.send_document(
-                    chat_id,
-                    bio,
-                    visible_file_name="allocation.xlsx",
-                    caption=summary,
-                )
-
-                explanation = build_allocation_explanation(
-                    state.alloc_df,
-                    alloc_vec,
-                    starting_budget,
-                    max_lines=20,
-                    alloc_is_delta=False,
-                )
-                bot.send_message(chat_id, explanation)
+                # ⬇️ Надсилаємо саме файл, збережений вище
+                try:
+                    with open("Result.xlsx", "rb") as f:
+                        bot.send_document(
+                            chat_id,
+                            f,
+                            visible_file_name="allocation_alternative.xlsx",  # назву можеш лишити як хочеш
+                            caption="Готово: алокація за альтернативним режимом (з формулами та підсвіткою)"
+                        )
+                except Exception as e:
+                    bot.send_message(chat_id, f"⚠️ Не вдалося відправити Excel: <code>{e}</code>", parse_mode="HTML")
 
                 state.phase = "WAIT_MAIN"
-                state.alloc_df = None
-                state.alloc_mode = None
-                state.alloc_budget = None
+                return
             else:
-                bot.reply_to(
-                    message,
-                    "Невідомий режим розподілу. Використай /allocate, щоб почати заново.",
-                )
-                state.phase = "WAIT_MAIN"
-                state.alloc_df = None
-                state.alloc_mode = None
-                state.alloc_budget = None
+                state.alloc_df = df_res
+                state.phase = "WAIT_ALLOC_BUDGET"
+                bot.reply_to(message, "✅ Файл Result прийнято. Введіть, будь ласка, бюджет (наприклад: 200).")
+
         else:
             bot.reply_to(message, "⚠️ Несподівана фаза. Спробуйте ще раз із головної таблиці.")
+
     except ValueError as ve:
-        # Catch wrong structure/columns
         bot.reply_to(
             message,
-            (
-                f"❌ Помилка у файлі <b>{filename}</b>:\n\n"
-                f"<code>{ve}</code>\n\n"
-                "Будь ласка, перевірте структуру таблиці та надішліть файл ще раз. "
-                "Очікувані колонки:\n"
-                "- Для головної таблиці: Назва Офферу, ГЕО, Загальні витрати\n"
-                "- Для додаткових таблиць: Країна, Сума депозитів"
-            ),
+            f"❌ Помилка у файлі <b>{filename}</b>:\n<code>{ve}</code>",
+            parse_mode="HTML"
         )
-        if state.phase in {"WAIT_ALLOC_RESULT", "WAIT_ALLOC_BUDGET", "WAIT_ALLOC_CHOICE"}:
-            state.phase = "WAIT_MAIN"
-            state.alloc_mode = None
-            state.alloc_df = None
-            state.alloc_budget = None
     except Exception as e:
-        bot.reply_to(message, f"⚠️ Непередбачена помилка: <code>{e}</code>")
-        if state.phase in {"WAIT_ALLOC_RESULT", "WAIT_ALLOC_BUDGET", "WAIT_ALLOC_CHOICE"}:
-            state.phase = "WAIT_MAIN"
-            state.alloc_mode = None
-            state.alloc_df = None
-            state.alloc_budget = None
+        bot.reply_to(message, f"⚠️ Непередбачена помилка: <code>{e}</code>", parse_mode="HTML")
 
 
 @bot.message_handler(commands=["allocate"])
@@ -1410,53 +1561,53 @@ def on_document(message: types.Message):
 def cmd_allocate(message: types.Message):
     chat_id = message.chat.id
     state = user_states.setdefault(chat_id, UserState())
-    state.phase = "WAIT_ALLOC_CHOICE"
+
+    # скинемо проміжний стан алокації
     state.alloc_df = None
     state.alloc_budget = None
     state.alloc_mode = None
+    state.phase = "WAIT_ALLOC_MODE"
 
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("📊 За бюджетом", callback_data="alloc_mode_budget"),
-        types.InlineKeyboardButton("💛 Максимум жовтих (Total+%)", callback_data="alloc_mode_max_yellow"),
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        types.InlineKeyboardButton("🔹 Оптимальна (локальна)", callback_data="alloc_mode:optimal"),
+        types.InlineKeyboardButton("🔹 Альтернативна (локальна без бюджету)", callback_data="alloc_mode:alternative"),
+    )
+    kb.add(
+        types.InlineKeyboardButton("🤖 OpenAI (без бюджету)", callback_data="alloc_mode:openai"),
     )
 
     bot.reply_to(
         message,
-        "Оберіть режим розподілу бюджету:",
-        reply_markup=keyboard,
+        "Оберіть режим алокації:",
+        reply_markup=kb
     )
 
 
-@bot.callback_query_handler(func=lambda c: c.data in {"alloc_mode_budget", "alloc_mode_max_yellow"})
+@bot.callback_query_handler(func=lambda c: c.data and c.data.startswith("alloc_mode:"))
 @require_access_cb
-def on_allocate_mode(call: types.CallbackQuery):
+def on_alloc_mode(call: types.CallbackQuery):
     chat_id = call.message.chat.id
     state = user_states.setdefault(chat_id, UserState())
+    mode = call.data.split(":", 1)[1]
 
-    if call.data == "alloc_mode_budget":
-        state.alloc_mode = "budget"
-        prompt = (
-            "Режим <b>за бюджетом</b> обрано. Надішліть файл <b>result.xlsx</b>. "
-            "Після завантаження попрошу вказати бюджет (Spend)."
-        )
-    else:
-        state.alloc_mode = "max_yellow"
-        prompt = (
-            "Режим <b>максимум жовтих</b> (цілі з <code>Total+%</code>) обрано. Надішліть файл <b>result.xlsx</b>. "
-            "Бюджет береться з колонок <code>Total+%</code>, тож нічого вводити вручну не потрібно."
-        )
+    if mode not in {"optimal", "alternative", "openai"}:
+        bot.answer_callback_query(call.id, "Невідомий режим.")
+        return
 
+    state.alloc_mode = mode
+    # Після вибору режиму просимо result.xlsx (для будь-якого режиму)
     state.phase = "WAIT_ALLOC_RESULT"
-    state.alloc_df = None
-    state.alloc_budget = None
-
-    try:
-        bot.answer_callback_query(call.id, "Режим застосовано.")
-    except Exception:
-        pass
-
-    bot.send_message(chat_id, prompt)
+    bot.answer_callback_query(call.id, "Режим обрано.")
+    bot.send_message(
+        chat_id,
+        (
+            "Надішліть файл <b>result.xlsx</b> (той, що бот згенерував раніше).\n\n"
+            "• У режимі <b>OpenAI</b> бюджет не потрібен — оброблю одразу після отримання файлу.\n"
+            "• У локальних режимах попрошу бюджет після завантаження файлу."
+        ),
+        parse_mode="HTML"
+    )
 
 
 @bot.message_handler(content_types=["text"], func=lambda m: not (m.text or "").startswith("/"))
@@ -1465,10 +1616,11 @@ def on_text(message: types.Message):
     chat_id = message.chat.id
     state = user_states.setdefault(chat_id, UserState())
 
-    # Only intercept when waiting for budget
+    # перехоплюємо тільки у фазі алокації
     if state.phase != "WAIT_ALLOC_BUDGET":
         return
 
+    # ===== Локальні режими: нижче все як було (потрібен бюджет) =====
     # Parse budget
     txt = (message.text or "").strip().replace(",", ".")
     try:
@@ -1482,15 +1634,12 @@ def on_text(message: types.Message):
     if state.alloc_df is None or len(state.alloc_df) == 0:
         bot.reply_to(message, "Немає завантаженої таблиці Result. Використай /allocate ще раз.")
         state.phase = "WAIT_MAIN"
-        state.alloc_mode = None
-        state.alloc_budget = None
         return
 
-    # Compute allocation
+    # Локальна алокація
     alloc_df, summary, alloc_vec = compute_optimal_allocation(state.alloc_df, budget)
 
-    # Build allocation.xlsx with the SAME structure as result.xlsx,
-    # applying the new Total spend (= old F + allocated extra)
+    # Формуємо файл із новими витратами
     bio = io.BytesIO()
     write_result_like_excel_with_new_spend(bio, state.alloc_df, new_total_spend=alloc_vec)
 
@@ -1502,19 +1651,15 @@ def on_text(message: types.Message):
         caption=summary  # короткий підсумок
     )
 
-    # ДЕТАЛЬНЕ ПОЯСНЕННЯ: куди пішов бюджет, статуси ДО/ПІСЛЯ, нові H і L
+    # Детальне пояснення
     explanation = build_allocation_explanation(state.alloc_df, alloc_vec, budget, max_lines=20)
     bot.send_message(chat_id, explanation)
 
-    # reset phase (or keep?)
     state.phase = "WAIT_MAIN"
-    state.alloc_mode = None
-    state.alloc_df = None
-    state.alloc_budget = None
 
 
 @bot.callback_query_handler(func=lambda c: c.data == "skip_offer")
-@require_access
+@require_access_cb
 def on_skip_offer(call: types.CallbackQuery):
     chat_id = call.message.chat.id
     state = user_states.setdefault(chat_id, UserState())
@@ -1543,13 +1688,7 @@ def on_skip_offer(call: types.CallbackQuery):
         # якщо оферів більше немає — генеруємо фінальний файл
         try:
             final_df = build_final_output(state)
-            if final_df.empty:
-                bot.send_message(
-                    chat_id,
-                    "ℹ️ Після пропуску всіх оферів не залишилось даних для експорту.",
-                )
-            else:
-                send_final_table(call.message, final_df)
+            send_final_table(call.message, final_df)
         except Exception as e:
             bot.send_message(chat_id, f"⚠️ Помилка під час формування файлу: <code>{e}</code>")
 
@@ -1829,7 +1968,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         for r in range(first_row, last_row + 1):
             ws[f"G{r}"].value = f"=F{r}*1.3"  # Total+%
             ws[f"H{r}"].value = f"=IFERROR(G{r}/E{r},\"\")"  # CPA
-            ws[f"I{r}"].value = CPA_TARGET_DEFAULT  # CPA Target
+            ws[f"I{r}"].value = cpa_target_for_geo(ws[f"D{r}"].value)  # CPA Target
             ws[f"J{r}"].value = f"=IFERROR(K{r}/E{r},\"\")"  # СP/Ч
             ws[f"L{r}"].value = f"=IFERROR(K{r}/G{r}*100,0)"  # My deposit amount
             ws[f"M{r}"].value = f"=G{r}*0.4"  # Profit 40%
@@ -1840,7 +1979,7 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         for r in range(first_row, last_row + 1):
             ws[f"E{r}"].number_format = "0"
 
-        # Two decimals: F..N except I (integer target column)
+        # Two decimals: F..N except I (integer target), but leave I as integer 8
         two_dec_cols = ["F", "G", "H", "J", "K", "L", "M", "N"]
         for col in two_dec_cols:
             for r in range(first_row, last_row + 1):
@@ -1862,35 +2001,40 @@ def send_final_table(message: types.Message, df: pd.DataFrame):
         for col, w in widths.items():
             ws.column_dimensions[col].width = w
 
-        # Conditional formatting за новими правилами
+        # Conditional formatting (unchanged logic, new letters)
         data_range = f"A{first_row}:P{last_row}"
         grey = PatternFill("solid", fgColor="BFBFBF")
         green = PatternFill("solid", fgColor="C6EFCE")
         yellow = PatternFill("solid", fgColor="FFEB9C")
         red = PatternFill("solid", fgColor="FFC7CE")
 
+        # Grey: E = 0
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=["$E2=0"], fill=grey, stopIfTrue=True),
+            FormulaRule(formula=["$E2=0"], fill=grey, stopIfTrue=True)
         )
+
+        # Green: INT(H) <= INT(I) AND L > 39
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=[f"AND($E2>0,$H2<=INT($I2),$L2>{DEPOSIT_GREEN_MIN:.0f})"], fill=green, stopIfTrue=True),
+            FormulaRule(formula=["AND($E2>0,INT($H2)<=INT($I2),$L2>39)"], fill=green, stopIfTrue=True)
         )
-        yellow_formula = _build_yellow_formula()
+
+        # Yellow: (INT(H) <= INT(I)) OR (L > 39 AND H < I*1.31)
         ws.conditional_formatting.add(
             data_range,
-            FormulaRule(formula=[yellow_formula], fill=yellow, stopIfTrue=True),
+            FormulaRule(formula=["AND($E2>0,OR(INT($H2)<=INT($I2),AND($L2>39,$H2<$I2*1.31)))"], fill=yellow,
+                        stopIfTrue=True)
         )
+
+        # Red: (E > 0 AND H > I*1.3 AND L > 39) OR (E > 0 AND INT(H) > INT(I) AND L < 39)
         ws.conditional_formatting.add(
             data_range,
             FormulaRule(
-                formula=[
-                    f"AND($E2>0,$H2>=$I2*{YELLOW_MULT:.2f},$H2<=$I2*{RED_MULT:.2f})"
-                ],
+                formula=["OR(AND($E2>0,$H2>$I2*1.3,$L2>39),AND($E2>0,INT($H2)>INT($I2),$L2<39))"],
                 fill=red,
-                stopIfTrue=True,
-            ),
+                stopIfTrue=True
+            )
         )
 
     bio.seek(0)
