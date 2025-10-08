@@ -440,7 +440,7 @@ def read_excel_robust(file_bytes: bytes, sheet_name: str, header: int = 0) -> pd
     raise ValueError(f"Could not read Excel file with any engine. Errors: {'; '.join(errors)}")
 
 
-def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded", month: int | None = None) -> pd.DataFrame:
+def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.DataFrame:
     df = None
     errors = []
 
@@ -482,7 +482,7 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded", month: i
 
         # --- filter current month ---
         # cur_month = datetime.now().month
-        cur_month = month
+        cur_month = 9
 
         if "Місяць" in df.columns:
             df["Місяць"] = pd.to_numeric(df["Місяць"], errors="coerce")
@@ -1406,13 +1406,13 @@ def start(message: types.Message):
         message,
         (
             "Привіт! 👋\n\n"
-            "1️⃣ Надішліть <b>головну таблицю</b> (CSV/XLSX) — аркуш <b>BUDG</b>.\n"
-            "2️⃣ У підписі до файлу (caption) вкажіть номер місяця, наприклад: <code>9</code>.\n\n"
-            "Бот відфільтрує дані по цьому місяцю."
+            "1) Надішли <b>головну таблицю</b> (CSV/XLSX) — аркуш <b>BUDG</b> з колонками: <b>Назва Офферу</b>, <b>ГЕО</b>, <b>Загальні витрати</b>.\n"
+            "2) Бот підсумує витрати по унікальних парах <b>Offer ID+ГЕО</b> і визначить список унікальних <b>Назв Офферу</b>.\n"
+            "3) Потім НА КОЖНУ <b>Назву Офферу</b> надішли одну додаткову таблицю (в ній є всі країни для цього офера) з колонками: <b>Країна</b>, <b>Сума депозитів</b>.\n"
+            "4) Фінал: Excel з колонками: Назва Офферу, ГЕО, Total Spend, Total Dep Sum, Total Dep Amount.\n"
+            "Надішли зараз головну таблицю."
         ),
-        parse_mode="HTML",
     )
-    user_states[chat_id].phase = "WAIT_MAIN"
 
 
 @bot.message_handler(content_types=["document"])
@@ -1430,20 +1430,6 @@ def on_document(message: types.Message):
         return
 
     try:
-        if state.phase == "WAIT_MAIN":
-            # Try to read month from caption
-            caption = message.caption or ""
-            try:
-                month = int(caption.strip())
-                if not 1 <= month <= 12:
-                    month = datetime.now().month
-            except ValueError:
-                month = datetime.now().month
-
-            df = load_main_budg_table(file_bytes, filename=filename, month=month)
-            bot.reply_to(message,
-                         f"✅ Головна таблиця завантажена (місяць: {month}). Тепер надішліть додаткові таблиці.")
-            handle_main_table(message, state, df)
         if state.phase == "WAIT_MAIN":
             df = load_main_budg_table(file_bytes, filename=filename)
             bot.reply_to(message, "✅ Головна таблиця завантажена! Тепер надішліть додаткові таблиці.")
