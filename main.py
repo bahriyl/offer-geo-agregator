@@ -482,7 +482,7 @@ def load_main_budg_table(file_bytes: bytes, filename: str = "uploaded") -> pd.Da
 
         # --- filter current month ---
         # cur_month = datetime.now().month
-        cur_month = 9
+        cur_month = 8
 
         if "Місяць" in df.columns:
             df["Місяць"] = pd.to_numeric(df["Місяць"], errors="coerce")
