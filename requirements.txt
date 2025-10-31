@@ -1,6 +1,6 @@
-pandas
-numpy
 python-dotenv
-pytelegrambotapi
-openpyxl
+pyTelegramBotAPI
 openai
+numpy
+pandas
+openpyxl
